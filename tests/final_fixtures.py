@@ -102,3 +102,53 @@ K must be a positive integer. If K exceeds the input length, print [].
 On invalid K or invalid JSON/non-integer array, exit nonzero and print a useful error to stderr.
 Use an O(n) algorithm. Preserve input files. Test the program before finishing.
 '''
+
+
+def chained_debugging_fixture(root):
+    """Require service links, paginated evidence, and time/dispatch disambiguation."""
+    prompt, expected = debugging_fixture(root, alternate=True)
+    expected.update(timeout_ms=4200, retry_count=2,
+                    lock_path='/srv/inventory/locks/reservations.lock',
+                    error_code='STALE_LEASE', root_cause_timestamp='2026-09-17T14:32:02.125Z')
+    del expected['queue_depth']
+    expected['payment_status'] = 'authorized'
+    e = expected
+    evidence = {
+        'gateway': [
+            '2026-09-17T14:31:00Z INFO req=gw-ok method=POST path=/api/checkout order=ORD-88120 status=200 upstream_trace=tr-ok',
+            '2026-09-17T14:32:04Z ERROR req=gw-other method=POST path=/api/checkout order=ORD-OTHER status=502 upstream_trace=tr-other',
+            f'2026-09-17T14:32:04Z ERROR req={e["gateway_request_id"]} method=POST path=/api/checkout order=ORD-88120 status=502',
+            *[f'2026-09-17T14:32:04Z INFO req={e["gateway_request_id"]} diagnostic_step={i}' for i in range(35)],
+            f'2026-09-17T14:32:04Z WARN req={e["gateway_request_id"]} upstream_trace={e["upstream_trace_id"]} upstream_status=504',
+        ],
+        'orders': [
+            '2026-09-17T14:31:00Z INFO trace=tr-ok payment_intent=pi_ok waiting_for_hold=hold-ok',
+            '2026-09-17T14:32:04Z ERROR trace=tr-other waiting_for_hold=hold-other payment_intent=pi_other timeout_ms=9000 retry_count=8',
+            f'2026-09-17T14:32:00Z INFO trace={e["upstream_trace_id"]} payment_intent={e["payment_intent_id"]}',
+            f'2026-09-17T14:32:04Z ERROR trace={e["upstream_trace_id"]} waiting_for_hold={e["hold_id"]} timeout_ms=4200 retry_count=2',
+        ],
+        'inventory': [
+            '2026-09-17T14:31:00Z INFO hold=hold-ok queued_on=inv-w1 dispatch=job-ok result=reserved',
+            '2026-09-17T14:32:00Z INFO hold=hold-other queued_on=inv-w8 dispatch=job-other',
+            '2026-09-17T14:32:01Z ERROR worker=inv-w8 dispatch=job-other component=StockCache code=OUT_OF_STOCK',
+            f'2026-09-17T14:30:00Z ERROR worker={e["worker"]} dispatch=job-old component=OldCache code=EXPIRED',
+            f'2026-09-17T14:32:00Z INFO hold={e["hold_id"]} queued_on={e["worker"]} dispatch=job-target',
+            f'{e["root_cause_timestamp"]} ERROR worker={e["worker"]} dispatch=job-target component={e["root_cause_component"]} code={e["error_code"]} lock_path={e["lock_path"]} message=reservation_failed_because_lease_owner_exited',
+            f'2026-09-17T14:35:00Z ERROR worker={e["worker"]} dispatch=job-later component=LaterCache code=DISCONNECTED',
+        ],
+        'payments': [
+            '2026-09-17T14:31:00Z INFO intent=pi_ok status=authorized',
+            '2026-09-17T14:32:00Z ERROR intent=pi_other status=failed component=PaymentTransport',
+            f'2026-09-17T14:32:00Z INFO intent={e["payment_intent_id"]} status=authorized',
+        ],
+    }
+    for service, rows in evidence.items():
+        lines = [f'2026-09-17T14:29:00Z INFO service={service} request=background-{i} status=ok\n' for i in range(800)]
+        # Spread evidence so a small context window cannot expose the whole chain.
+        for i, row in enumerate(rows):
+            lines.insert(100 + i * 15, row + '\n')
+        (root / 'logs' / (service + '.log')).write_text(''.join(lines))
+    prompt = prompt.replace('except timeout_ms, retry_count, and queue_depth', 'except timeout_ms and retry_count')
+    prompt = prompt.replace('12. queue_depth: queue depth when that hold was queued.',
+                            '12. payment_status: status from the payments service for the linked payment intent.')
+    return prompt, expected

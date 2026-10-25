@@ -12,9 +12,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--live', action='store_true', help='Enable every endpoint test.')
     parser.add_argument('--pause', type=float, default=10, help='Seconds between live agent invocations (default 10).')
+    parser.add_argument('--repeat-final', type=int, default=1,
+                        help='Run the six final-checkpoint tasks this many times in fresh workspaces (with --live).')
     args = parser.parse_args()
     if args.pause < 0:
         parser.error('--pause must not be negative')
+    if args.repeat_final < 1 or args.repeat_final > 1 and not args.live:
+        parser.error('--repeat-final must be positive, and repeats require --live')
     flags = ['RUN_LIVE_TESTS', 'RUN_EXTENDED_LIVE_TESTS', 'RUN_CHECKPOINT2_LIVE_TESTS', 'RUN_FINAL_LIVE_TESTS']
     for flag in flags:
         if args.live:
@@ -39,6 +43,9 @@ def main():
                             (Checkpoint2LiveTests, 'turn'), (MemoryLiveTests, 'turn'), (FinalLiveTests, 'invoke')]:
             setattr(cls, method, paced(getattr(cls, method)))
     suite = unittest.defaultTestLoader.discover(str(root / 'tests'))
+    if args.live:
+        for _ in range(args.repeat_final - 1):
+            suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(FinalLiveTests))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 

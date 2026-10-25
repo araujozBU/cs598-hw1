@@ -55,14 +55,14 @@ def parse_completion(response):
     return result
 
 
-def request_completion(messages, tools, deadline, temperature=0):
+def request_completion(messages, tools, deadline, temperature=0, tool_choice='auto'):
     key = os.environ.get('QWEN_API_KEY', '').strip()
     if not key:
         raise AgentError('QWEN_API_KEY is not set.')
     model = os.environ.get('MODEL', 'Qwen/Qwen3-14B')
     if model != 'Qwen/Qwen3-14B':
         raise AgentError('MODEL must be Qwen/Qwen3-14B.')
-    body = {'model': model, 'messages': messages, 'tools': tools, 'tool_choice': 'auto',
+    body = {'model': model, 'messages': messages, 'tools': tools, 'tool_choice': tool_choice,
             'parallel_tool_calls': False,
             'temperature': temperature, 'top_p': 0.8 if temperature else 1.0,
             'max_tokens': 8192, 'stream': True,
@@ -86,7 +86,9 @@ def request_completion(messages, tools, deadline, temperature=0):
             if os.environ.get('AGENT_DEBUG') == '1':
                 print(f'Endpoint HTTP {exc.code}: {detail}', file=sys.stderr)
             # Retry rejected requests only. Never replay a successful completion.
-            if exc.code in (429, 502, 503, 504) and attempt < 2:
+            transport_rejection = (exc.code == 400 and 'Bad request syntax' in detail
+                                   and '<html' in detail.lower())
+            if (exc.code in (429, 502, 503, 504) or transport_rejection) and attempt < 2:
                 try:
                     delay = min(30, max(2 * (attempt + 1), float(exc.headers.get('Retry-After', 0))))
                 except (TypeError, ValueError):

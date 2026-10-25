@@ -1,18 +1,23 @@
 """End-to-end generation tests against known synthetic inputs and exact outputs."""
 
 import hashlib
+import csv
+from decimal import Decimal
 import json
 import os
+import random
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from agent import Workspace
-from final_fixtures import ALTERNATIVE_PROGRAM, debugging_fixture, programming_fixture
+from final_fixtures import ALTERNATIVE_PROGRAM, debugging_fixture, programming_fixture, chained_debugging_fixture
+from final_coverage import assert_tally_coverage, LOCAL_EXTENSIONS
 
 
 @unittest.skipUnless(os.environ.get('RUN_FINAL_LIVE_TESTS') == '1', 'Set RUN_FINAL_LIVE_TESTS=1 for final-checkpoint tasks')
@@ -33,6 +38,7 @@ class FinalLiveTests(unittest.TestCase):
         (self.root / 'TASK.md').write_text(prompt)
         before = {p.relative_to(self.root): hashlib.sha256(p.read_bytes()).hexdigest()
                   for p in self.root.rglob('*') if p.is_file()}
+        started = time.monotonic()
         process = subprocess.run(['bash', str(ROOT / 'run_agent.sh'), prompt, '9001'],
                                  cwd=self.root, stdout=subprocess.PIPE,
                                  stderr=None if os.environ.get('AGENT_DEBUG') == '1' else subprocess.PIPE,
@@ -45,6 +51,7 @@ class FinalLiveTests(unittest.TestCase):
         for path, digest in before.items():
             self.assertEqual(hashlib.sha256((self.root / path).read_bytes()).hexdigest(), digest, str(path))
         self.assertTrue((self.root / 'unrelated/empty').is_dir())
+        print(f'Agent elapsed: {time.monotonic() - started:.1f}s', file=sys.stderr)
         print('Final task result: ' + result['message'], file=sys.stderr)
 
     def run_generated(self, path, args, stdin=''):
@@ -76,6 +83,96 @@ class FinalLiveTests(unittest.TestCase):
                                (['top', '8', '--file', 'custom.csv'], 'other\t-3.00\n')]:
             with self.subTest(args=args):
                 self.assertEqual(self.run_generated('tally.py', args), expected)
+        # Test the generated program against new data it never saw while being
+        # written. No additional model calls or guessed hidden requirements.
+        for rows in [[],
+                     [('2026-01-01', 'One cent, quoted', 'FOOD', '0.01')],
+                     [('2026-01-01', 'Purchase\nwith newline', 'Food', '0.10'),
+                      ('2026-01-02', 'Refund', 'FOOD', '-0.20'),
+                      ('2026-01-02', 'Ride', 'Travel', '-0.10'),
+                      ('2026-01-03', 'Gift', 'Books', '0.00')]]:
+            with (self.root / 'edge.csv').open('w', newline='') as handle:
+                writer = csv.writer(handle)
+                writer.writerow(['date', 'description', 'category', 'amount'])
+                writer.writerows(rows)
+            amounts = [Decimal(row[3]) for row in rows]
+            groups = {}
+            for row in rows:
+                category = row[2].lower()
+                groups[category] = groups.get(category, Decimal(0)) + Decimal(row[3])
+            top = ''.join(f'{name}\t{amount:.2f}\n' for name, amount in
+                          sorted(groups.items(), key=lambda item: (-item[1], item[0])))
+            selected = [Decimal(row[3]) for row in rows if row[0] == '2026-01-02']
+            cases = [(['count'], f'{len(rows)}\n'),
+                     (['total'], f'{sum(amounts, Decimal(0)):.2f}\n'),
+                     (['total', '--category', 'fOoD'], f'{groups.get("food", Decimal(0)):.2f}\n'),
+                     (['top', '9'], top),
+                     (['range', '--from', '2026-01-02', '--to', '2026-01-02'],
+                      f'count={len(selected)} total={sum(selected, Decimal(0)):.2f}\n')]
+            for args, expected in cases:
+                with self.subTest(rows=len(rows), args=args):
+                    self.assertEqual(self.run_generated('tally.py', [args[0], '--file', 'edge.csv', *args[1:]]), expected)
+
+        assert_tally_coverage(self, self.root, self.run_generated_cli)
+
+    def run_generated_cli(self, path, args, stdin='', success=True):
+        # Direct CLI, no harness execution wrapper. -S excludes site-packages;
+        # clear Python search-path overrides and credentials in the child.
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(('PYTHON', 'OPENAI', 'QWEN'))}
+        env['PYTHONDONTWRITEBYTECODE'] = '1'
+        process = subprocess.run([sys.executable, '-S', str(self.root / path), *args],
+                                 cwd=self.root, input=stdin, capture_output=True,
+                                 text=True, timeout=30, env=env)
+        if success:
+            self.assertEqual(process.returncode, 0, process.stderr)
+        else:
+            self.assertNotEqual(process.returncode, 0)
+            self.assertTrue(process.stderr.strip())
+            self.assertEqual(process.stdout, '')
+        return process.stdout
+
+    def test_local_programming_extensions_json_and_invalid_rows(self):
+        # These semantics are supplied in the prompt; they are NOT predictions
+        # of the hidden grading requirements.
+        self.invoke(programming_fixture(self.root) + LOCAL_EXTENSIONS)
+        rows = [
+            ['2026-01-01', 'Purchase', 'Food', '1.25'],
+            ['2026-01-02', 'Refund', 'FOOD', '-0.25'],
+            ['2026-01-03', 'Train', 'Travel', '2.00'],
+            ['2026-02-30', 'Invalid date', 'Food', '99.00'],
+            ['bad-date', 'Invalid date', 'Food', '99.00'],
+            ['2026-01-01', 'Invalid amount', 'Food', 'NaN'],
+            ['2026-01-01', 'Infinite', 'Food', 'Infinity'],
+            ['2026-01-01', 'Text', 'Food', 'oops'],
+            ['2026-01-01', 'Too precise', 'Food', '1.001'],
+            ['2026-01-01', 'No category', '', '99.00'],
+            ['2026-01-01', 'Missing field', 'Food'],
+            ['2026-01-01', 'Extra field', 'Food', '99.00', 'extra'],
+        ]
+        with (self.root / 'invalid.csv').open('w', newline='') as handle:
+            writer = csv.writer(handle)
+            writer.writerow(['date', 'description', 'category', 'amount'])
+            writer.writerows(rows)
+        checks = [(['count'], '3\n', {'count': 3}),
+                  (['total'], '3.00\n', {'total': '3.00'}),
+                  (['total', '--category', 'fOoD'], '1.00\n', {'total': '1.00'}),
+                  (['total', '--category', 'missing'], '0.00\n', {'total': '0.00'}),
+                  (['top', '5'], 'travel\t2.00\nfood\t1.00\n',
+                   [{'category': 'travel', 'total': '2.00'}, {'category': 'food', 'total': '1.00'}]),
+                  (['range', '--from', '2026-01-01', '--to', '2026-01-02'],
+                   'count=2 total=1.00\n', {'count': 2, 'total': '1.00'})]
+        for args, plain, structured in checks:
+            with self.subTest(args=args):
+                self.assertEqual(self.run_generated_cli('tally.py', [*args, '--file', 'invalid.csv']), plain)
+                for position in (1, len(args)):
+                    invocation = args[:position] + ['--json', '--file', 'invalid.csv'] + args[position:]
+                    actual = json.loads(self.run_generated_cli('tally.py', invocation))
+                    # JSON canonicalization also distinguishes booleans/floats from integers.
+                    self.assertEqual(json.dumps(actual, sort_keys=True), json.dumps(structured, sort_keys=True))
+        for args in [['count', '--file', 'absent.csv'], ['unsupported']]:
+            with self.subTest(args=args):
+                self.run_generated_cli('tally.py', args, success=False)
 
     def test_programming_generalizes_to_different_task(self):
         self.invoke(ALTERNATIVE_PROGRAM)
@@ -84,12 +181,34 @@ class FinalLiveTests(unittest.TestCase):
             with self.subTest(k=k, values=values):
                 self.assertEqual(self.run_generated('windows.py', [str(k)], json.dumps(values)),
                                  json.dumps(expected, separators=(',', ':')) + '\n')
+        rng = random.Random(598)
+        for length in (0, 1, 17, 1000):
+            values = [rng.randint(-100000, 100000) for _ in range(length)]
+            for k in (1, 3, max(1, length), length + 1):
+                expected = [sum(values[i:i+k]) for i in range(max(0, length-k+1))]
+                with self.subTest(length=length, k=k):
+                    self.assertEqual(self.run_generated_cli('windows.py', [str(k)], json.dumps(values)),
+                                     json.dumps(expected, separators=(',', ':')) + '\n')
         result = self.workspace.execute('run_python', {'path': 'windows.py', 'args': ['0'], 'stdin': '[1,2]'})
         self.assertNotEqual(result['exit_code'], 0)
         self.assertTrue(result['stderr'])
+        for k, stdin in [('x', '[1,2]'), ('-1', '[1,2]'), ('2', 'not json'),
+                         ('2', '{}'), ('2', 'null'), ('2', '42'), ('2', '"text"'), ('2', '[null]'), ('2', '[[]]'), ('2', '[1,"2"]'), ('2', '[true,2]'), ('2', '[1.5,2]')]:
+            with self.subTest(k=k, stdin=stdin):
+                result = self.workspace.execute('run_python', {'path': 'windows.py', 'args': [k], 'stdin': stdin})
+                self.assertNotEqual(result['exit_code'], 0, result)
+                self.assertTrue(result['stderr'], result)
 
     def test_debugging_follows_ids_and_exact_report_schema(self):
         prompt, expected = debugging_fixture(self.root)
+        self.invoke(prompt)
+        result = json.loads((self.root / 'REPORT.json').read_text())
+        self.assertEqual(result, expected)
+        for key, value in expected.items():
+            self.assertIs(type(result[key]), type(value), key)
+
+    def test_debugging_chained_worker_and_payment_evidence(self):
+        prompt, expected = chained_debugging_fixture(self.root)
         self.invoke(prompt)
         result = json.loads((self.root / 'REPORT.json').read_text())
         self.assertEqual(result, expected)

@@ -8,12 +8,14 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from agent import AgentError, MAX_MODEL_CALLS, Workspace, run_agent
+from agent import AgentError, MAX_MODEL_CALLS, PROGRAMMING_PROMPT, Workspace, model_request, run_agent
 from model_client import parse_completion, request_completion
+from completion_checks import CompletionChecks
 
 
 class FinalToolTests(unittest.TestCase):
@@ -203,7 +205,272 @@ class FinalToolTests(unittest.TestCase):
         checks = [json.loads(m['content']) for m in history if m['role'] == 'tool'
                   and 'outputs_match' in json.loads(m['content'])]
         self.assertEqual([c['outputs_match'] for c in checks], [False, True])
-        self.assertEqual([c['status'] for c in checks], ['success', 'success'])
+        self.assertEqual([c['status'] for c in checks], ['error', 'success'])
+
+    def scripted(self, prompt, steps):
+        history = []
+        replies = iter(steps)
+        def request(messages, deadline):
+            try:
+                return next(replies)
+            except StopIteration:
+                self.fail('The agent rejected the completed repair or consumed unexpected model turns.')
+        result = run_agent(prompt, self.workspace, request=request, history=history)
+        self.assertEqual(result['message'], 'Verified.')
+        return history
+
+    @staticmethod
+    def call(name, **arguments):
+        return {'tool_calls': [{'id': name, 'type': 'function', 'function': {
+            'name': name, 'arguments': json.dumps(arguments)}}]}
+
+    def test_mismatch_cannot_be_hidden_by_other_success_or_omitted_reference(self):
+        c = self.call
+        self.scripted('Implement answer.py that prints 4.', [
+            c('write_file', path='answer.py', content='print(5)'),
+            c('run_python', path='answer.py', reference_code='print(4)'),
+            c('list_files'),
+            c('finish', status='success', message='Wrong output accepted.'),
+            c('run_python', path='answer.py'),
+            {'content': '{"status":"success","message":"Comparison skipped."}'},
+            c('replace_text', path='answer.py', old='print(5)', new='print(4)'),
+            c('run_python', path='answer.py', reference_code='print(4)'),
+            c('finish', status='success', message='Verified.'),
+        ])
+
+    def test_incorrect_reference_can_be_repaired_without_changing_program(self):
+        c = self.call
+        self.scripted('Implement answer.py that prints 4.', [
+            c('write_file', path='answer.py', content='print(4)'),
+            c('run_python', path='answer.py', reference_code='print(5)'),
+            c('review_mismatch', decision='repair_reference', reason='The task requests 4, but the reference prints 5.'),
+            c('run_python', path='answer.py', reference_code='print(4)'),
+            c('finish', status='success', message='Verified.'),
+        ])
+        self.assertEqual((self.root / 'answer.py').read_text(), 'print(4)')
+
+    def test_programming_mismatch_is_reviewed_in_a_fresh_context(self):
+        messages = [{'role': 'system', 'content': PROGRAMMING_PROMPT},
+                    {'role': 'user', 'content': 'Implement answer.py to print 4.'},
+                    {'role': 'assistant', 'content': 'Untrusted earlier repair speculation.'},
+                    self.call('run_python', path='answer.py', reference_code='print(5)') | {'role': 'assistant'},
+                    {'role': 'tool', 'tool_call_id': 'run_python', 'content': json.dumps({
+                        'exit_code': 0, 'stdout': '4\n', 'outputs_match': False,
+                        'reference': {'exit_code': 0, 'stdout': '5\n'}})}]
+        with patch('agent.request_completion', return_value={'content': None}) as requested:
+            model_request(messages, time.monotonic() + 5)
+        self.assertEqual(requested.call_args.kwargs['tool_choice']['function']['name'], 'review_mismatch')
+        self.assertNotIn('Untrusted earlier repair speculation', json.dumps(requested.call_args.args[0]))
+        self.assertIn('Implement answer.py to print 4.', requested.call_args.args[0][-1]['content'])
+
+    def test_pending_failures_identify_distinct_stdin_inputs_exactly(self):
+        c = self.call
+        history = self.scripted('Implement answer.py to print 4.', [
+            c('write_file', path='answer.py', content='print(5)'),
+            c('run_python', path='answer.py', stdin='first', reference_code='print(4)'),
+            c('run_python', path='answer.py', stdin='second', reference_code='print(4)'),
+            c('write_file', path='answer.py', content='print(4)'),
+            c('run_python', path='answer.py', stdin='first', reference_code='print(4)'),
+            c('finish', status='success', message='Second input forgotten.'),
+            c('run_python', path='answer.py', stdin='second', reference_code='print(4)'),
+            c('finish', status='success', message='Verified.'),
+        ])
+        pending = next(json.loads(message['content'])['pending_checks'] for message in history
+                       if message['role'] == 'tool' and 'pending_checks' in json.loads(message['content']))
+        self.assertEqual([item['arguments']['stdin'] for item in pending], ['second'])
+
+    def test_failed_command_stays_pending_after_a_different_command_passes(self):
+        c = self.call
+        self.scripted('Implement answer.py.', [
+            c('write_file', path='answer.py', content='import sys; sys.exit(int(sys.argv[1]))'),
+            c('run_python', path='answer.py', args=['1']),
+            c('run_python', path='answer.py', args=['0']),
+            c('finish', status='success', message='Failed command forgotten.'),
+            c('write_file', path='answer.py', content='print(4)'),
+            c('run_python', path='answer.py', args=['1']),
+            c('finish', status='success', message='Verified.'),
+        ])
+
+    def test_deliberate_error_can_correct_its_expected_exit_code_and_reference(self):
+        c = self.call
+        self.scripted('Implement answer.py to reject invalid input.', [
+            c('write_file', path='answer.py', content='import sys; sys.exit(2)'),
+            c('run_python', path='answer.py', reference_code='import sys; sys.exit(2)'),
+            c('run_python', path='answer.py', expected_exit_code=2, reference_code='import sys; sys.exit(2)'),
+            c('finish', status='success', message='Verified.'),
+        ])
+
+    def test_expected_rejection_does_not_require_a_successful_reference(self):
+        c = self.call
+        self.scripted('Implement answer.py to reject invalid input.', [
+            c('write_file', path='answer.py', content='import sys; sys.exit(2)'),
+            c('run_python', path='answer.py', expected_exit_code=2,
+              reference_code='raise ValueError("reference is broken")'),
+            c('finish', status='success', message='Verified.'),
+        ])
+
+    def test_programming_inspection_is_not_a_deliverable(self):
+        c = self.call
+        self.scripted('Implement answer.py that prints 4.', [
+            c('list_files'),
+            c('finish', status='success', message='Missing program accepted.'),
+            c('write_file', path='answer.py', content='print(4)'),
+            c('run_python', path='answer.py'),
+            c('finish', status='success', message='Verified.'),
+        ])
+
+    def test_programming_syntax_error_is_returned_immediately_after_write(self):
+        c = self.call
+        history = self.scripted('Implement answer.py.', [
+            c('write_file', path='answer.py', content='print(args.from)'),
+            c('finish', status='success', message='Syntax error ignored.'),
+            c('write_file', path='answer.py', content='print(4)'),
+            c('run_python', path='answer.py'),
+            c('finish', status='success', message='Verified.'),
+        ])
+        first_write = next(json.loads(m['content']) for m in history if m['role'] == 'tool')
+        self.assertEqual(first_write['status'], 'error')
+        self.assertIn('line 1', first_write['syntax_error'])
+        self.assertIn('safe argparse dest', first_write['repair_hint'])
+
+    def test_repeated_syntax_breaking_edits_require_a_full_rewrite(self):
+        c = self.call
+        history = self.scripted('Implement answer.py.', [
+            c('write_file', path='answer.py', content='print(4)'),
+            c('replace_text', path='answer.py', old='print(4)', new='print('),
+            c('replace_text', path='answer.py', old='print(', new='print(1,'),
+            c('replace_text', path='answer.py', old='print(1,', new='print(2,'),
+            c('replace_text', path='answer.py', old='print(2,', new='print(4)'),
+            c('write_file', path='answer.py', content='print(4)'),
+            c('run_python', path='answer.py'),
+            c('finish', status='success', message='Verified.'),
+        ])
+        self.assertTrue(any('clean implementation' in message['content'] for message in history if message['role'] == 'tool'))
+
+    def test_real_programming_requests_plan_before_writing(self):
+        messages = [{'role': 'system', 'content': PROGRAMMING_PROMPT}, {'role': 'user', 'content': 'Implement answer.py.'}]
+        with patch('agent.request_completion', return_value={'content': None}) as requested:
+            model_request(messages, time.monotonic() + 5)
+            self.assertEqual(requested.call_args.kwargs['tool_choice']['function']['name'], 'plan_program')
+            messages.append(self.call('plan_program', interface='answer.py', approach='Print a value', checks=['Run it']) | {'role': 'assistant'})
+            model_request(messages, time.monotonic() + 5)
+            self.assertNotIn('tool_choice', requested.call_args.kwargs)
+            messages.append({'role': 'user', 'content': 'Implement another.py.'})
+            model_request(messages, time.monotonic() + 5)
+            self.assertEqual(requested.call_args.kwargs['tool_choice']['function']['name'], 'plan_program')
+
+    def test_constraint_deliverable_required_for_all_final_response_formats(self):
+        c = self.call
+        for premature in [c('finish', status='success', message='Missing report accepted.'),
+                          {'content': 'Report complete.'},
+                          {'content': '{"status":"success","message":"Report complete."}'}]:
+            with self.subTest(premature=premature):
+                path = self.root / 'findings.json'
+                if path.exists():
+                    path.unlink()
+                self.scripted('CONSTRAINT: Your final deliverable is a file named `findings.json` in the current directory.', [
+                    premature,
+                    c('write_file', path='findings.json', content='{}'),
+                    c('finish', status='success', message='Verified.'),
+                ])
+
+    def test_invalid_json_deliverable_is_repaired_before_finish(self):
+        c = self.call
+        self.scripted('Write findings.json containing a valid JSON object in the current directory.', [
+            c('write_file', path='findings.json', content='{broken'),
+            c('finish', status='success', message='Invalid JSON accepted.'),
+            c('write_file', path='findings.json', content='{"answer":4}'),
+            c('finish', status='success', message='Verified.'),
+        ])
+
+    def test_exact_text_creation_does_not_infer_json_from_filename(self):
+        c = self.call
+        self.scripted('Create example.json containing exactly hello.', [
+            c('write_file', path='example.json', content='hello'),
+            c('finish', status='success', message='Verified.'),
+        ])
+        self.assertEqual((self.root / 'example.json').read_bytes(), b'hello')
+
+    def test_csv_output_tools_count_as_writing_the_requested_deliverable(self):
+        c = self.call
+        (self.root / 'source.csv').write_text('id,status\n1,complete\n2,cancelled\n')
+        for name, arguments in [
+            ('copy_csv', {'path': 'source.csv', 'output_path': 'copy.csv'}),
+            ('update_csv', {'path': 'source.csv', 'output_path': 'updated.csv',
+                            'id_column': 'id', 'row_id': '1', 'column': 'status', 'value': 'pending'}),
+            ('remove_csv_rows', {'path': 'source.csv', 'output_path': 'active.csv',
+                                 'column': 'status', 'operator': 'eq', 'value': 'cancelled'}),
+        ]:
+            with self.subTest(name=name):
+                self.scripted('Save ' + arguments['output_path'] + ' using source.csv.', [
+                    c(name, **arguments), c('finish', status='success', message='Verified.'),
+                ])
+
+    def test_strict_json_integer_array_requires_invalid_type_checks(self):
+        c = self.call
+        history = self.scripted('Implement answer.py. Read a JSON array of integers. Reject invalid non-integer arrays.', [
+            c('write_file', path='answer.py', content='import json, sys; values=json.load(sys.stdin); sys.exit(0 if all(type(x) is int for x in values) else 1)'),
+            c('run_python', path='answer.py', stdin='[1,2]'),
+            c('run_python', path='answer.py', expected_exit_code=1, stdin='[true,1.5,"2"]'),
+            c('finish', status='success', message='Mixed invalid types accepted as isolated checks.'),
+            c('run_python', path='answer.py', expected_exit_code=1, stdin='["2"]'),
+            c('finish', status='success', message='Boolean and float checks omitted.'),
+            c('run_python', path='answer.py', expected_exit_code=1, stdin='[true]'),
+            c('run_python', path='answer.py', expected_exit_code=1, stdin='[1.5]'),
+            c('finish', status='success', message='Verified.'),
+        ])
+        hints = [json.loads(message['content'])['suggested_tool_call'] for message in history
+                 if message['role'] == 'tool' and 'suggested_tool_call' in json.loads(message['content'])]
+        self.assertTrue(hints)
+        self.assertIs(json.loads(hints[0]['arguments']['stdin'])[0], True)
+        self.assertEqual(hints[0]['arguments']['args'], [])
+
+    def test_integer_type_diagnostic_proposes_a_specific_source_repair(self):
+        c = self.call
+        history = self.scripted('Implement answer.py. Read a JSON array of integers. Reject invalid non-integer arrays.', [
+            c('write_file', path='answer.py', content='import json, sys; values=json.load(sys.stdin); sys.exit(0 if all(isinstance(x, int) for x in values) else 1)'),
+            c('replace_text', path='answer.py', old='isinstance(x, int)', new='(type(x) is int)'),
+            c('run_python', path='answer.py', stdin='[1,2]'),
+            c('run_python', path='answer.py', expected_exit_code=1, stdin='[true]'),
+            c('run_python', path='answer.py', expected_exit_code=1, stdin='[1.5]'),
+            c('run_python', path='answer.py', expected_exit_code=1, stdin='["2"]'),
+            c('finish', status='success', message='Verified.'),
+        ])
+        first_write = next(json.loads(m['content']) for m in history if m['role'] == 'tool')
+        self.assertIn('booleans', first_write['validation_error'])
+        self.assertEqual(first_write['suggested_tool_call']['arguments']['new'], '(type(x) is int)')
+        checks = CompletionChecks(self.workspace, set(), True, integer_array=True)
+        self.assertIsNone(checks.source_review('ok = isinstance(x, int) and not isinstance(x, bool)', 'example.py'))
+
+    def test_scalar_money_zero_case_is_required_and_fixed_precision_is_checked(self):
+        c = self.call
+        self.scripted('Implement answer.py. All money values use exactly two decimals. '
+                      '`python3 answer.py sum` prints the sum.', [
+            c('write_file', path='answer.py', content='import sys; print("4.00" if sys.stdin.read().strip() else "0")'),
+            c('run_python', path='answer.py', args=['sum'], stdin='4'),
+            c('finish', status='success', message='Zero case omitted.'),
+            c('run_python', path='answer.py', args=['sum']),
+            c('finish', status='success', message='Unformatted zero accepted.'),
+            c('replace_text', path='answer.py', old='else "0"', new='else "0.00"'),
+            c('run_python', path='answer.py', args=['sum']),
+            c('finish', status='success', message='Verified.'),
+        ])
+
+    def test_incident_report_requires_all_requested_keys_and_inspected_values(self):
+        c = self.call
+        (self.root / 'service.log').write_text('trace=trace-blue child=child-green\n')
+        self.scripted('Incident: trace a failure using service.log. Write findings.json. '
+                      'Copy values exactly from log evidence. Required keys:\n'
+                      '1. trace: trace ID.\n2. child: linked child ID.', [
+            c('write_file', path='findings.json', content='{"trace":"trace-blue"}'),
+            c('finish', status='success', message='Missing key accepted.'),
+            c('write_file', path='findings.json', content='{"trace":"trace-blue","child":""}'),
+            c('finish', status='success', message='Empty value accepted.'),
+            c('write_file', path='findings.json', content='{"trace":"trace-blue","child":"child-green"}'),
+            c('finish', status='success', message='Uninspected evidence accepted.'),
+            c('search_file', path='service.log', query='trace-blue'),
+            c('finish', status='success', message='Verified.'),
+        ])
 
     def test_reference_error_does_not_discard_actual_program_output(self):
         (self.root / 'answer.py').write_text('print(2 + 2)')
@@ -273,6 +540,24 @@ class FinalToolTests(unittest.TestCase):
 
 
 class StreamTests(unittest.TestCase):
+    def test_retries_html_transport_rejection_but_not_regular_http_400(self):
+        for transport in (True, False):
+            with self.subTest(transport=transport):
+                detail = b'<html>Bad request syntax (JSON body)</html>' if transport else b'{"error":"invalid messages"}'
+                error = urllib.error.HTTPError('https://example.invalid', 400, 'Bad Request', {}, io.BytesIO(detail))
+                response = io.BytesIO(b'{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}]}')
+                response.headers = {'Content-Type': 'application/json'}
+                with patch.dict(os.environ, {'QWEN_API_KEY': 'test-key'}), \
+                        patch('model_client.urllib.request.urlopen', side_effect=[error, response]) as opened, \
+                        patch('model_client.time.sleep'):
+                    if transport:
+                        self.assertEqual(request_completion([], [], time.monotonic() + 60)['content'], 'hello')
+                        self.assertEqual(opened.call_count, 2)
+                    else:
+                        with self.assertRaises(AgentError):
+                            request_completion([], [], time.monotonic() + 60)
+                        self.assertEqual(opened.call_count, 1)
+
     def stream(self, events):
         data = ''.join('data: ' + json.dumps(e) + '\n\n' for e in events) + 'data: [DONE]\n\n'
         response = io.BytesIO(data.encode())

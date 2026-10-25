@@ -9,6 +9,7 @@ library. No agent SDK or additional Python packages are required.
 - `requirements.txt`: documents that no third-party packages are required; no installation step is needed.
 - `run_agent.sh`: entry point; resolves source code relative to itself and preserves the task working directory.
 - `agent.py`: tool loop, workspace operations, completion checks, and final JSON output.
+- `completion_checks.py`: requested-output checks, incident-report evidence, and pending program-test tracking.
 - `model_client.py`: streaming Chat Completions client with thinking disabled.
 - `workspace_tools.py`: bounded log/source inspection and Python execution tools.
 - `python_runner.py`: read-only execution guard for generated Python and analysis snippets.
@@ -111,7 +112,7 @@ Run offline checks from the submission folder:
 python3 -m unittest discover -s tests -v
 ```
 
-The complete suite has 55 offline tests and 19 optional live tests, including final-checkpoint checks. To run only the three live
+The complete suite has 75 offline tests and 21 optional live tests, including final-checkpoint checks. To run only the three live
 Checkpoint 2 conversations (10 separate agent invocations, sequentially):
 
 ```bash
@@ -158,7 +159,10 @@ current source. Never submit generated session histories or credentials.
 ## Checkpoint 3: programming and debugging
 
 The same loop handles new programming and debugging prompts. Programming
-requests use a focused system prompt with general implementation/testing guidance. It has no built-in
+requests first ask Qwen for an interface, approach and verification plan, then
+use a focused system prompt with general implementation/testing guidance. Written
+Python source is compiled immediately so syntax errors reach the model before
+it spends another call attempting execution. It has no built-in
 `tally.py` solution, incident IDs, or expected report values. Those are confined
 to test fixtures. `list_files`, `read_lines`, and `search_file` inspect the actual
 workspace; `write_file` creates the requested deliverable. `replace_text` makes
@@ -174,7 +178,14 @@ including later failures following successful attempts.
 An optional `reference_code` runs an independent Python calculation against the
 same inputs and compares its actual stdout with the saved program's stdout.
 Both results and `outputs_match` are returned; an incorrect reference never
-erases the program's output. This avoids asking the model to guess or manually
+erases the program's output. A mismatch blocks completion until the same check
+is rerun successfully with a corrected program or reference. Deliberate error
+tests use `expected_exit_code` and should omit the reference calculation; a correct
+rejection is accepted even if an optional reference is broken. Positive-output
+disagreements receive a focused Qwen review in a fresh context before the next
+repair action, distinguishing candidate defects from broken reference calculations.
+This review uses the same Qwen model endpoint and counts toward the 120-call cap.
+This avoids asking the model to guess or manually
 transcribe expected totals. Independent live tests still fail on any incorrect
 output. Explicit requests to print compact JSON also receive a format check.
 `analyze_python` executes a short snippet for independent calculations or report
@@ -182,6 +193,34 @@ validation. A programming task cannot report success until every Python source
 file it wrote has been run with the expected exit code after its last edit. This is a minimum
 completion check, not proof of program correctness; live tests separately compare
 outputs with expected results on multiple inputs.
+
+Explicitly named output files must exist and have been written during the task;
+inspection alone cannot satisfy a programming request. Explicit JSON deliverables
+must parse; a filename extension alone does not change an exact-text request.
+For incident reports with an enumerated schema, the keys must match the
+prompt, required values cannot be empty, and strings requested verbatim from logs
+must appear in inspected evidence. A focused debugging prompt follows each failed
+request through its service-specific identifiers and checks successful branches
+as well as the causal failure. These checks contain no fixed assignment answers.
+Failed program commands stay pending across unrelated successful operations;
+the same arguments and stdin must be checked again. A failed reference must be
+repaired rather than omitted. Completion feedback includes the exact pending
+arguments, stdin and reference code so separate inputs cannot be confused.
+Checks still cannot prove semantic correctness.
+Tasks explicitly requiring rejection of non-integer JSON array elements must
+exercise boolean, float and string rejection in separate arrays after the final
+source edit, using arguments that also pass a valid-integer control. A source
+diagnostic identifies unsafe `isinstance(value, int)` checks and proposes an
+exact-type replacement; explicit boolean guards are allowed.
+When a CLI specification explicitly requires two-decimal money output and identifies
+commands that print a scalar sum/total, those commands also need a successful
+zero-result test after the final source edit. The output validator catches plain
+`0` as well as other incorrect numeric precision without supplying a task solution.
+
+To repeat final-checkpoint tasks in fresh workspaces while rerunning all earlier
+capabilities, use `python3 scripts/run_tests.py --live --repeat-final 3`.
+Set `KEEP_FINAL_TESTS=1` to retain final-task workspaces for diagnosing failures;
+keep those retained workspaces outside the submission archive.
 
 Execution uses a separate Python process, an environment without the API key,
 and a read-only audit guard. Normal file writes, network calls, subprocesses,
@@ -205,8 +244,10 @@ Programming prompts receive a bounded workspace inventory and CSV preview with
 the actual row count and sums of numeric columns, so illustrative example numbers are less likely to be
 confused with the supplied data. Rejected malformed tool arguments are stored
 as valid JSON in history so they cannot break the next API request.
-Programming requests use temperature 0.7 and top-p 0.8, following the non-thinking
-sampling recommendation in the [Qwen model card](https://huggingface.co/Qwen/Qwen3-14B#best-practices).
+Programming requests use temperature 0.2 and top-p 0.8 to reduce variation between
+independent generations. Repeated syntax-breaking edits count toward the clean-rewrite
+threshold. Rejected HTML HTTP 400 responses reporting bad HTTP request syntax
+receive bounded retries; ordinary HTTP 400 validation errors do not.
 Other requests retain temperature 0. Thinking remains disabled in every request.
 
 The live final tests include a 40,000-row spending CSV (quoted commas, refunds,
@@ -780,3 +821,10 @@ exit
 The course uses hidden cases. These checks reproduce the invocation and observable
 checks, but passing them does not guarantee a particular grade. Before submitting,
 repeat the checks against an extracted clean archive to verify its contents too.
+
+### Expanded Checkpoint 3 test coverage
+
+See `tests/fixtures/coverage.md` for the requirement-to-test map, the six live
+tasks, and the distinction between published requirements and explicitly defined
+local practice extensions. New tally checks use an independent integer-cent
+oracle and direct CLI execution with site-packages disabled.

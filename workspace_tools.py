@@ -31,7 +31,7 @@ WORKSPACE_TOOLS = [
                'subprocesses, or access to session history. stdout, stderr, exit code and timeout are returned. '
                'Use write_file to create/fix the program before testing it. Only standard library is available. '
                'For exact-output checks supply reference_code, an independent Python calculation reading actual inputs and printing the answer. Do not import/run the candidate program from the reference. The tool returns both outputs and outputs_match. '
-               'For invalid-input tests, set expected_exit_code to the nonzero exit code the program should return.',
+               'For invalid-input tests, set expected_exit_code to the nonzero exit code the program should return and omit reference_code.',
                {'path': STRING, 'args': {'type': 'array', 'items': STRING},
                 'stdin': STRING, 'reference_code': STRING, 'expected_exit_code': {'type': 'integer'},
                 'timeout_seconds': {'type': 'integer', 'minimum': 1, 'maximum': 30}}, ['path']),
@@ -172,8 +172,12 @@ def run_python(workspace, arguments):
         reference = run_python(workspace, {'code': arguments['reference_code'], 'args': args,
             'stdin': arguments.get('stdin', ''), 'timeout_seconds': duration})
         result['reference'] = reference
-        result['outputs_match'] = (result['exit_code'] == reference['exit_code'] == 0
+        result['outputs_match'] = (result['exit_code'] == reference['exit_code'] == arguments.get('expected_exit_code', 0)
             and not result['output_truncated'] and not reference['output_truncated']
             and result['stdout'] == reference['stdout'])
         result['hint'] = 'Compare both outputs and review the reference calculation before changing source. Reference code is a check, not a grader.'
+        if (reference['exit_code'] != arguments.get('expected_exit_code', 0)
+                or reference['timed_out'] or reference['output_truncated']):
+            result['hint'] = ('The reference calculation failed. Repair reference_code and rerun this same check. '
+                              'The saved program output is preserved; do not rewrite the program to match a broken reference.')
     return result
