@@ -149,6 +149,30 @@ class CompletionChecks:
                                 'suggested_tool_call': {'name': 'replace_text', 'arguments': {
                                     'path': path, 'old': ast.get_source_segment(source, declaration),
                                     'new': 'pass  # Removed unused greedy positional.'}}}
+                for declaration in positional:
+                    keywords = {kw.arg: kw.value for kw in declaration.keywords}
+                    nargs = keywords.get('nargs')
+                    dest = keywords.get('dest', declaration.args[0])
+                    if (not isinstance(nargs, ast.Constant) or nargs.value != '*'
+                            or not isinstance(dest, ast.Constant) or not isinstance(dest.value, str)):
+                        continue
+                    scalar = [call for call in calls
+                              if isinstance(call.func, ast.Name)
+                              and call.func.id in ('int', 'float', 'Decimal')
+                              and call.args and isinstance(call.args[0], ast.Attribute)
+                              and isinstance(call.args[0].value, ast.Name)
+                              and call.args[0].value.id == namespace
+                              and call.args[0].attr == dest.value]
+                    if scalar:
+                        old = ast.get_source_segment(source, declaration)
+                        new = re.sub(r'nargs\s*=\s*([\'\"])\*\1', "nargs='?'", old, count=1)
+                        error = (f'{namespace}.{dest.value} is a list because its positional argument uses '
+                                 'nargs="*", but a scalar conversion reads it directly. Use nargs="?" '
+                                 'for one optional value and validate absence in the command handler.')
+                        self.source_errors[path] = error
+                        return {'validation_error': error,
+                                'suggested_tool_call': {'name': 'replace_text', 'arguments': {
+                                    'path': path, 'old': old, 'new': new}}}
                 unused = {}
                 for declaration in declarations:
                     if ast.dump(declaration.func.value) != parser:

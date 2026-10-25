@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from agent import Workspace
-from final_fixtures import ALTERNATIVE_PROGRAM, debugging_fixture, programming_fixture, chained_debugging_fixture
+from final_fixtures import ALTERNATIVE_PROGRAM, MERGE_INTERVALS_PROGRAM, debugging_fixture, programming_fixture, chained_debugging_fixture
 from final_coverage import assert_tally_coverage, LOCAL_EXTENSIONS
 
 
@@ -199,6 +199,52 @@ class FinalLiveTests(unittest.TestCase):
                 result = self.workspace.execute('run_python', {'path': 'windows.py', 'args': [k], 'stdin': stdin})
                 self.assertNotEqual(result['exit_code'], 0, result)
                 self.assertTrue(result['stderr'], result)
+
+    def test_programming_merges_intervals(self):
+        self.invoke(MERGE_INTERVALS_PROGRAM)
+        cases = [
+            ([], []),
+            ([[5, 7]], [[5, 7]]),
+            ([[1, 3], [2, 6], [8, 10], [15, 18]], [[1, 6], [8, 10], [15, 18]]),
+            ([[4, 4], [4, 5], [1, 2]], [[1, 2], [4, 5]]),
+            ([[1, 2], [3, 4]], [[1, 2], [3, 4]]),
+            ([[-5, -2], [-3, 0], [0, 0], [7, 7]], [[-5, 0], [7, 7]]),
+        ]
+        rng = random.Random(598)
+        for length in (3, 12, 30):
+            for _ in range(5):
+                intervals = []
+                for _ in range(length):
+                    start, end = sorted((rng.randint(-20, 20), rng.randint(-20, 20)))
+                    intervals.append([start, end])
+                rng.shuffle(intervals)
+                # An interval graph oracle is deliberately different from the
+                # usual sort-and-scan implementation expected from the agent.
+                remaining = set(range(len(intervals)))
+                merged = []
+                while remaining:
+                    component = {remaining.pop()}
+                    frontier = list(component)
+                    while frontier:
+                        current = frontier.pop()
+                        for other in list(remaining):
+                            a, b = intervals[current]
+                            c, d = intervals[other]
+                            if a <= d and c <= b:
+                                remaining.remove(other)
+                                component.add(other)
+                                frontier.append(other)
+                    merged.append([min(intervals[i][0] for i in component),
+                                   max(intervals[i][1] for i in component)])
+                cases.append((intervals, sorted(merged)))
+        for intervals, expected in cases:
+            with self.subTest(intervals=intervals):
+                self.assertEqual(self.run_generated_cli('merge_intervals.py', [], json.dumps(intervals)),
+                                 json.dumps(expected, separators=(',', ':')) + '\n')
+        for invalid in ('', 'not json', '{}', 'null', '[1]', '[[1]]', '[[2,1]]',
+                        '[[true,3]]', '[[1.5,2]]', '[[1,"2"]]', '[[1,2,3]]', '[[1,2],null]'):
+            with self.subTest(invalid=invalid):
+                self.run_generated_cli('merge_intervals.py', [], invalid, success=False)
 
     def test_debugging_follows_ids_and_exact_report_schema(self):
         prompt, expected = debugging_fixture(self.root)

@@ -104,6 +104,25 @@ Use an O(n) algorithm. Preserve input files. Test the program before finishing.
 '''
 
 
+MERGE_INTERVALS_PROGRAM = '''Implement merge_intervals.py in the current directory using Python 3's standard library.
+This is a standalone programming practice task; no data file is supplied.
+
+Invocation: python3 merge_intervals.py
+Read one JSON array of closed intervals from stdin. Each interval must be a two-element
+array [start, end] of JSON integers with start <= end. Booleans, floats, strings,
+missing endpoints, and extra endpoints are invalid.
+
+Merge intervals that overlap, including intervals sharing an endpoint. For example,
+[[1,3],[3,5],[8,9]] becomes [[1,5],[8,9]], while [[1,2],[3,4]] stays separate.
+Print the merged intervals sorted by start as one compact JSON array followed by a
+newline, with no other stdout. An empty input array prints [].
+
+On invalid JSON or invalid intervals, exit nonzero, print a useful error to stderr,
+and print nothing to stdout. Use an O(n log n) algorithm or better. Preserve all
+unrelated files. Test the saved program before finishing.
+'''
+
+
 def chained_debugging_fixture(root):
     """Require service links, paginated evidence, and time/dispatch disambiguation."""
     prompt, expected = debugging_fixture(root, alternate=True)

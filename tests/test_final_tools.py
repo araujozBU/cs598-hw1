@@ -163,6 +163,24 @@ class FinalToolTests(unittest.TestCase):
         self.assertIsNone(checks.source_review(source.replace("'all regions'", 'a.region_name'), 'app.py'))
         self.assertIsNone(checks.source_review(source.replace("print('all regions')", 'handle_options(a)'), 'app.py'))
 
+    def test_list_positional_cannot_be_converted_as_single_integer(self):
+        checks = CompletionChecks(self.workspace, set(), True)
+        source = ("import argparse\np=argparse.ArgumentParser()\n"
+                  "p.add_argument('command')\np.add_argument('value', nargs='*')\n"
+                  "a=p.parse_intermixed_args()\nprint(int(a.value))\n")
+        result = checks.source_review(source, 'app.py')
+        self.assertIn('is a list', result['validation_error'])
+        edit = result['suggested_tool_call']['arguments']
+        self.assertEqual(edit['old'], "p.add_argument('value', nargs='*')")
+        self.assertEqual(edit['new'], "p.add_argument('value', nargs='?')")
+        (self.root / 'app.py').write_text(source)
+        self.workspace.execute('replace_text', edit)
+        self.assertIsNone(checks.source_review((self.root / 'app.py').read_text(), 'app.py'))
+        actual = self.workspace.execute('run_python', {'path': 'app.py', 'args': ['top', '3']})
+        self.assertEqual(actual['stdout'], '3\n')
+        self.assertIsNone(checks.source_review(source.replace('print(int(a.value))',
+                                              'print([int(x) for x in a.value])'), 'app.py'))
+
     def test_repeated_identical_mismatch_returns_to_repair_instead_of_review(self):
         check = {'outputs_match': False, 'exit_code': 0, 'stdout': '4',
                  'reference': {'exit_code': 0, 'stdout': '3'}, 'repeat_failure': True}
@@ -820,6 +838,40 @@ class FinalToolTests(unittest.TestCase):
         edit = result['suggested_tool_call']['arguments']
         self.workspace.execute('replace_text', edit)
         self.assertEqual(probe_invalid_csv_rows(self.workspace, 'count.py', 'input.csv')['status'], 'success')
+
+    def test_cli_rejection_probe_requires_clean_errors_before_success(self):
+        (self.root / 'input.csv').write_text('name\nItem\n')
+        broken = ("import sys\npath = sys.argv[sys.argv.index('--file') + 1]\n"
+                  "with open(path) as handle:\n    print(len(handle.readlines()) - 1)\n")
+        handles_missing = ("import sys\npath = sys.argv[sys.argv.index('--file') + 1]\n"
+                           "try:\n    with open(path) as handle:\n        print(len(handle.readlines()) - 1)\n"
+                           "except FileNotFoundError as exc:\n"
+                           "    print(f'Error: {exc}', file=sys.stderr)\n    sys.exit(1)\n")
+        handles_both = handles_missing.replace(
+            "path = sys.argv[sys.argv.index('--file') + 1]\n",
+            "if sys.argv[1] != 'count':\n"
+            "    print('Unsupported command', file=sys.stderr)\n    sys.exit(2)\n"
+            "path = sys.argv[sys.argv.index('--file') + 1]\n")
+        replies = iter([
+            self.call('write_file', path='count.py', content=broken),
+            self.call('run_python', path='count.py', args=['count', '--file', 'input.csv']),
+            self.call('write_file', path='count.py', content=handles_missing),
+            self.call('run_python', path='count.py', args=['count', '--file', 'input.csv']),
+            self.call('write_file', path='count.py', content=handles_both),
+            self.call('run_python', path='count.py', args=['count', '--file', 'input.csv']),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        history = []
+        result = run_agent('Implement count.py with a count command and --file PATH for CSV input. '
+                           'A missing input file or unsupported command must exit nonzero with a useful '
+                           'message on stderr and no stdout.', self.workspace,
+                           request=lambda messages, deadline: next(replies), history=history)
+        self.assertEqual(result['message'], 'Verified.')
+        self.assertEqual((self.root / 'count.py').read_text(), handles_both)
+        self.assertTrue(any('missing input file' in message['content'] for message in history
+                            if message['role'] == 'tool'))
+        self.assertTrue(any('unsupported command' in message['content'] for message in history
+                            if message['role'] == 'tool'))
 
     def test_repeated_broken_reference_fails_before_task_timeout(self):
         replies = iter([

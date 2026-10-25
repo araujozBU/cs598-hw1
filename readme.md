@@ -113,7 +113,7 @@ Run offline checks from the submission folder:
 python3 -m unittest discover -s tests -v
 ```
 
-The complete suite includes offline tests and 21 optional live tests, including final-checkpoint checks. To run only the three live
+The complete suite includes offline tests and 22 optional live tests, including final-checkpoint checks. To run only the three live
 Checkpoint 2 conversations (10 separate agent invocations, sequentially):
 
 ```bash
@@ -165,7 +165,9 @@ use a focused system prompt with general implementation/testing guidance. Writte
 Python source is compiled immediately so syntax errors reach the model before
 it spends another call attempting execution. For statically declared argparse
 interfaces, source review also reports required flags missing from `add_argument`
-or parsed option values that the handlers never use;
+or parsed option values that the handlers never use. It detects a list-valued
+`nargs='*'` positional passed directly to a scalar conversion and suggests a
+single optional value when appropriate;
 positional `nargs='*'` does not capture undeclared options. Dynamic declarations
 and parsers using `parse_known_args` are left to execution tests. It has no built-in
 `tally.py` solution, incident IDs, or expected report values. Those are confined
@@ -271,6 +273,10 @@ zero-result test after the final source edit. The output validator catches plain
 
 To repeat final-checkpoint tasks in fresh workspaces while rerunning all earlier
 capabilities, use `python3 scripts/run_tests.py --live --repeat-final 3`.
+For a focused Part 3 reliability run, use
+`KEEP_FINAL_TESTS=1 AGENT_DEBUG=1 python3 scripts/run_tests.py --live --final-only --repeat-final 3`.
+This runs the seven Part 3 practice tasks three times in fresh workspaces and
+retains each generated workspace for inspecting any failure.
 Set `KEEP_FINAL_TESTS=1` to retain final-task workspaces for diagnosing failures;
 keep those retained workspaces outside the submission archive.
 
@@ -312,7 +318,7 @@ Other requests retain temperature 0. Thinking remains disabled in every request.
 
 The live final tests include a 40,000-row spending CSV (quoted commas, refunds,
 mixed category case, ties, date boundaries, alternate input paths), a different
-sliding-window programming problem, and two noisy four-service log incidents
+sliding-window and merge-intervals programming problems, and two noisy four-service log incidents
 with different identifiers and causal classes. Tests check exact outputs, JSON
 keys/types, and preservation of all supplied inputs and unrelated files. The six
 unpublished programming requirements and six unpublished report fields are not
@@ -483,6 +489,9 @@ The four live-test flags are independent. `RUN_FINAL_LIVE_TESTS=1` enables the
 new generation tasks; `scripts/run_tests.py --live` enables all four groups.
 Live tests use the shared GPU sequentially; prefer offline tests during routine
 development and use live cases when checking model behavior.
+For CSV command-line tasks that explicitly require clean errors for a missing
+input file or unsupported command, the agent also runs those rejection cases
+before accepting success. A traceback or stdout on either path prompts repair.
 
 Each live case creates a fresh temporary workspace and launches a separate agent
 process. The tests check exact creation, selective deletion, the expected answer
@@ -885,7 +894,7 @@ repeat the checks against an extracted clean archive to verify its contents too.
 
 ### Expanded Checkpoint 3 test coverage
 
-See `tests/fixtures/coverage.md` for the requirement-to-test map, the six live
+See `tests/fixtures/coverage.md` for the requirement-to-test map, the seven live
 tasks, and the distinction between published requirements and explicitly defined
 local practice extensions. New tally checks use an independent integer-cent
 oracle and direct CLI execution with site-packages disabled.

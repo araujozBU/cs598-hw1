@@ -99,6 +99,29 @@ def probe_invalid_csv_rows(workspace, source_path, input_csv):
     return {'status': 'success', 'message': 'Malformed CSV rows did not change the count result.'}
 
 
+def probe_cli_rejections(workspace, source_path, input_csv, missing_file, unsupported_command):
+    """Exercise error paths explicitly required by a CLI task prompt."""
+    cases = []
+    if missing_file:
+        absent = '.agent_missing_' + str(time.monotonic_ns()) + '.csv'
+        cases.append(('missing input file', ['count', '--file', absent]))
+    if unsupported_command:
+        cases.append(('unsupported command', ['__agent_unknown_command__', '--file', input_csv]))
+    for case_name, args in cases:
+        result = workspace.execute('run_python', {'path': source_path, 'args': args})
+        if (result['exit_code'] != 0 and result['stderr'].strip()
+                and 'Traceback' not in result['stderr'] and not result['stdout']
+                and not result['timed_out'] and not result['output_truncated']):
+            continue
+        return {'status': 'error', 'repair_required': True, 'probe_case': case_name,
+                'message': ('The task requires a useful stderr message and no stdout for ' + case_name +
+                            '. Catch the expected input/command error explicitly, print its message to '
+                            'sys.stderr, and exit nonzero without a Python traceback.'),
+                'probed': result,
+                'current_source': workspace.execute('read_lines', {'path': source_path, 'max_lines': 500})}
+    return {'status': 'success', 'message': 'Required CLI error paths produced useful stderr without tracebacks.'}
+
+
 SYSTEM_PROMPT = """You are an agent for file management, conversation, programming and debugging inside a task workspace.
 Complete the user's request using the provided tools. Paths are relative to the
 workspace. Never access files outside it. Do not change unrelated files.
@@ -199,6 +222,8 @@ Use a simple implementation. For a one-level CLI with interspersed options, pref
 Adapt those names and declare EVERY flag from the user's specification. Dispatch on args.action.
 Positional nargs='*' does NOT capture undeclared --options: argparse rejects them before your handler runs.
 Do not put a greedy '*' positional before an optional '?' positional: it consumes that value first.
+An argument with nargs='*' is a list. For one numeric or string value use nargs='?'
+and check for a missing value in the command handler before converting it.
 For a command-specific value keep it optional globally and validate it inside only the command that requires it.
 Use named attributes for declared options. Keep source concise to leave time for verification and repairs.
 Do not combine a command positional with subparsers: subparsers already consume the command name.
@@ -565,6 +590,9 @@ def run_agent(prompt, workspace, request=model_request, history=None):
     outputs = requested_outputs(prompt, programming_task)
     invalid_csv_probe = (programming_task and bool(re.search(r'\bskip\s+invalid\s+rows\b', prompt, re.I))
                          and '--file' in prompt and bool(re.search(r'\bcount\b', prompt, re.I)))
+    cli_probe = (programming_task and '--file' in prompt and bool(re.search(r'\bcount\b', prompt, re.I)))
+    missing_file_probe = cli_probe and bool(re.search(r'\bmissing\s+(?:input\s+)?file\b', prompt, re.I))
+    unsupported_command_probe = cli_probe and bool(re.search(r'\bunsupported\s+command\b', prompt, re.I))
     initial_csv = None
     needs_workspace = needs_workspace or bool(outputs) or programming_task
     integer_array = programming_task and bool(re.search(r'\bJSON array of integers\b', prompt, re.I)
@@ -645,6 +673,7 @@ def run_agent(prompt, workspace, request=model_request, history=None):
     reference_failures = {}
     probe_failures = {}
     probed_sources = set()
+    cli_probed_sources = set()
     syntax_failure_locations = {}
     for _ in range(MAX_MODEL_CALLS):
         if time.monotonic() >= deadline:
@@ -756,6 +785,23 @@ def run_agent(prompt, workspace, request=model_request, history=None):
                                                      'content': json.dumps(probe, ensure_ascii=False)})
                                     continue
                                 probed_sources.add(workspace.file_path(source).read_bytes())
+                    if result['status'] == 'success' and initial_csv and (missing_file_probe or unsupported_command_probe):
+                        source = next((path for path in sorted(outputs) if path.endswith('.py')), None)
+                        if source and workspace.file_path(source).read_bytes() not in cli_probed_sources:
+                            probe = probe_cli_rejections(workspace, source, initial_csv,
+                                                         missing_file_probe, unsupported_command_probe)
+                            debug_tool_result('cli_probe', {'path': source}, probe, tool_started)
+                            if probe['status'] == 'error':
+                                last_operation_failed = True
+                                last_failure = probe['message']
+                                signature = ('cli', workspace.file_path(source).read_bytes())
+                                probe_failures[signature] = probe_failures.get(signature, 0) + 1
+                                if probe_failures[signature] >= 3:
+                                    raise AgentError('CLI rejection probe failed three times without a source repair.')
+                                messages.append({'role': 'tool', 'tool_call_id': call['id'],
+                                                 'content': json.dumps(probe, ensure_ascii=False)})
+                                continue
+                            cli_probed_sources.add(workspace.file_path(source).read_bytes())
                     return complete(result, finish_tool=True)
                 if name == 'plan_program':
                     if (not isinstance(arguments, dict) or set(arguments) != {'interface', 'approach', 'checks'}
@@ -858,6 +904,26 @@ def run_agent(prompt, workspace, request=model_request, history=None):
                                     raise AgentError('Malformed CSV probe failed three times without a source repair.')
                             else:
                                 probed_sources.add(source_bytes)
+                if (name == 'run_python' and not execution_failed and initial_csv
+                        and (missing_file_probe or unsupported_command_probe)
+                        and arguments['path'] in outputs and arguments['path'].endswith('.py')):
+                    source_bytes = workspace.file_path(arguments['path']).read_bytes()
+                    if source_bytes not in cli_probed_sources:
+                        probe = probe_cli_rejections(workspace, arguments['path'], initial_csv,
+                                                     missing_file_probe, unsupported_command_probe)
+                        result['cli_probe'] = {key: value for key, value in probe.items()
+                                               if key != 'current_source'}
+                        if probe['status'] == 'error':
+                            result['probe_error'] = probe['message']
+                            result['probe_case'] = probe['probe_case']
+                            result['current_source'] = probe['current_source']
+                            candidate_failed = execution_failed = True
+                            signature = ('cli', source_bytes)
+                            probe_failures[signature] = probe_failures.get(signature, 0) + 1
+                            if probe_failures[signature] >= 3:
+                                raise AgentError('CLI rejection probe failed three times without a source repair.')
+                        else:
+                            cli_probed_sources.add(source_bytes)
                 if name == 'run_python':
                     reference = result.get('reference', {})
                     if (not candidate_failed and 'reference_code' in arguments

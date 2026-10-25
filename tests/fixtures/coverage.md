@@ -1,6 +1,6 @@
 # Checkpoint 3 coverage
 
-Run the six end-to-end tasks with:
+Run the seven end-to-end tasks with:
 
 ```sh
 RUN_FINAL_LIVE_TESTS=1 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p test_final_live.py -v
@@ -41,6 +41,12 @@ The windows.py task remains generalization practice; it additionally checks
 seeded arrays and invalid JSON value types. Its functional checks do not prove
 O(n) complexity. Direct -S execution catches ordinary third-party import
 dependencies but is not a formal dependency or security audit.
+
+The merge_intervals.py task is a separate LeetCode-style generalization exercise.
+It checks overlap at endpoints, disjoint and nested intervals, negatives, empty
+input, deterministic random cases against an interval-graph oracle, compact JSON,
+and strict rejection of malformed intervals. Its output checks do not prove the
+requested O(n log n) complexity.
 
 Passing these tests cannot guarantee the six unreleased requirements in either
 category, all possible inputs, model reliability, or performance in the grader's
