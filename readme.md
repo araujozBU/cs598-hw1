@@ -162,15 +162,23 @@ The same loop handles new programming and debugging prompts. Programming
 requests first ask Qwen for an interface, approach and verification plan, then
 use a focused system prompt with general implementation/testing guidance. Written
 Python source is compiled immediately so syntax errors reach the model before
-it spends another call attempting execution. It has no built-in
+it spends another call attempting execution. For statically declared argparse
+interfaces, source review also reports required flags missing from `add_argument`
+or parsed option values that the handlers never use;
+positional `nargs='*'` does not capture undeclared options. Dynamic declarations
+and parsers using `parse_known_args` are left to execution tests. It has no built-in
 `tally.py` solution, incident IDs, or expected report values. Those are confined
 to test fixtures. `list_files`, `read_lines`, and `search_file` inspect the actual
 workspace; `write_file` creates the requested deliverable. `replace_text` makes
 a unique, exact snippet replacement for a small source correction while preserving
-all other file bytes. Edited Python source must be tested again. After repeated
+all other file bytes. Failed exact replacements return current numbered source
+so the model can repair its stale snippet. Edited Python source must be tested again. After repeated
 failed program runs, the agent must replace the full source rather than continue
-an ineffective sequence of small patches. Search returns up to
-20 matches with context and a continuation line for larger results. The agent is
+an ineffective sequence of small patches. Syntax repairs that advance to a different
+error line preserve progress instead of triggering that rewrite rule. Search defaults to 100 matches
+(configurable up to 200), prioritizing matching lines within the output budget.
+Broad searches omit surrounding noise; larger results include a continuation
+call. The agent is
 instructed to follow the failed incident's identifiers and check all matches,
 including later failures following successful attempts.
 
@@ -185,6 +193,8 @@ rejection is accepted even if an optional reference is broken. Positive-output
 disagreements receive a focused Qwen review in a fresh context before the next
 repair action, distinguishing candidate defects from broken reference calculations.
 This review uses the same Qwen model endpoint and counts toward the 120-call cap.
+An identical repeated failure returns current source for repair instead of forcing
+another identical review. The failed check remains pending until resolved.
 This avoids asking the model to guess or manually
 transcribe expected totals. Independent live tests still fail on any incorrect
 output. Explicit requests to print compact JSON also receive a format check.

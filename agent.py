@@ -115,6 +115,8 @@ Use a simple implementation. For a one-level CLI with interspersed options, pref
     parser.add_argument('--input', default='input.txt')
     args = parser.parse_intermixed_args()
 Adapt those names and declare EVERY flag from the user's specification. Dispatch on args.action.
+Positional nargs='*' does NOT capture undeclared --options: argparse rejects them before your handler runs.
+Use named attributes for declared options. Keep source concise to leave time for verification and repairs.
 Do not combine a command positional with subparsers: subparsers already consume the command name.
 For flag names that are Python keywords, specify a safe dest or use getattr(args, 'keyword'); attribute syntax with a keyword is invalid.
 Use csv.DictReader for CSV quoting, Decimal for exact money, and json.loads/json.dumps for JSON.
@@ -161,7 +163,7 @@ Follow the identifier chain carefully:
 5. Follow branches as well as the causal chain. A payment or another operation can succeed while the overall request fails.
    Extract each requested fact from its own evidence; do not assume the payment failed or has no ID.
 
-Use search_file with literal IDs and small context, and read_lines for nearby evidence. A search is scoped
+Use search_file with literal IDs and context_lines=0 first, and read_lines for nearby evidence. A search is scoped
 to one file. If truncated, continue at next_line; otherwise use start_line=1 when searching a new identifier.
 Keep a concise evidence map of requested fields and their source file/line. Never guess missing values or use empty placeholders.
 If an identifier is missing, search the preceding service for the correct link, not arbitrary unrelated IDs.
@@ -277,7 +279,7 @@ def model_request(messages, deadline):
     latest_user = max((index for index, message in enumerate(messages) if message.get('role') == 'user'), default=0)
     if programming and messages[-1].get('role') == 'tool':
         check = json.loads(messages[-1]['content'])
-        if (check.get('outputs_match') is False and check.get('exit_code') == 0
+        if (check.get('outputs_match') is False and not check.get('repeat_failure') and check.get('exit_code') == 0
                 and check.get('reference', {}).get('exit_code') == 0):
             arguments = {}
             for message in reversed(messages[:-1]):
@@ -374,7 +376,8 @@ def run_agent(prompt, workspace, request=model_request, history=None):
     checks = CompletionChecks(workspace, outputs, programming_task, prompt if debugging_task else '',
                               validate_json=bool(re.search(r'(?<!\.)\bJSON\b', prompt, re.I)),
                               integer_array=integer_array,
-                              money_commands=scalar_money_commands(prompt) if programming_task else ())
+                              money_commands=scalar_money_commands(prompt) if programming_task else (),
+                              programming_prompt=prompt if programming_task else '')
     system = PROGRAMMING_PROMPT if programming_task else DEBUGGING_PROMPT if debugging_task else SYSTEM_PROMPT
     messages = [{"role": "system", "content": system},
                 *(history or []), {"role": "user", "content": prompt}]
@@ -421,6 +424,7 @@ def run_agent(prompt, workspace, request=model_request, history=None):
     last_operation_failed = False
     last_failure = ''
     program_failures = {}
+    syntax_failure_locations = {}
     for _ in range(MAX_MODEL_CALLS):
         if time.monotonic() >= deadline:
             raise AgentError("Task exceeded its time limit.")
@@ -509,7 +513,13 @@ def run_agent(prompt, workspace, request=model_request, history=None):
                             or any(not isinstance(check, str) or not check.strip() for check in arguments['checks'])):
                         raise ValueError('Provide interface, approach, and a nonempty list of checks.')
                     messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': json.dumps({
-                        'status': 'success', 'message': 'Plan recorded. Implement the complete plan, then test the saved program.'})})
+                        'status': 'success', 'message': 'Plan recorded. Implement the complete plan, then test the saved program.',
+                        'required_cli_options': sorted(checks.required_options),
+                        'implementation_checklist': [
+                            'Declare every required CLI option and use its parsed value in the handler.',
+                            'Use json.dumps for JSON output; do not manually escape JSON inside f-strings.',
+                            'Implement every input-validity rule in one reusable validator shared by the commands.',
+                            'Keep the source concise and test invalid data as well as the supplied valid data.']})})
                     continue
                 if name == 'review_mismatch':
                     if (not isinstance(arguments, dict) or set(arguments) != {'decision', 'reason'}
@@ -542,6 +552,7 @@ def run_agent(prompt, workspace, request=model_request, history=None):
                                 result.update(review)
                         except SyntaxError as exc:
                             result['syntax_error'] = f'{exc.msg} at line {exc.lineno}: {exc.text}'
+                            result['syntax_error_line'] = exc.lineno
                             result['repair_hint'] = ('The file was written but is not valid Python. Repair this syntax before testing. '
                                 'Read the surrounding source and repair the complete block with consistent indentation.')
                             if re.search(r'\.\s*(?:' + '|'.join(keyword.kwlist) + r')\b', exc.text or ''):
@@ -559,12 +570,23 @@ def run_agent(prompt, workspace, request=model_request, history=None):
                     or bool(result.get('syntax_error') or result.get('validation_error')))
                 if name == 'run_python':
                     checks.tested(arguments, result, execution_failed)
+                    if result.get('repeat_failure'):
+                        result['current_source'] = workspace.execute('read_lines', {
+                            'path': arguments['path'], 'max_lines': 150})
+                        result['repair_hint'] = ('This exact check produced the same failure again. Inspect current_source '
+                            'and the reference, then make a concrete correction before rerunning; repeating the same '
+                            'test or review adds no evidence.')
                 if execution_failed:
                     last_operation_failed = True
                     result = {'status': 'error', **result}
                     if name in ('write_file', 'replace_text') and result.get('syntax_error'):
                         path = arguments['path']
-                        program_failures[path] = program_failures.get(path, 0) + 1
+                        location = result['syntax_error_line']
+                        # Moving to a later error is progress, not a failed repair
+                        # of the same error. Preserve those successful local edits.
+                        program_failures[path] = (program_failures.get(path, 0) + 1
+                                                  if syntax_failure_locations.get(path) == location else 1)
+                        syntax_failure_locations[path] = location
                         if program_failures[path] >= 3:
                             result['repair_hint'] = ('Repeated edits are leaving invalid syntax. Read the complete source, '
                                                      'then replace the program with a clean implementation using write_file.')
@@ -595,6 +617,16 @@ def run_agent(prompt, workspace, request=model_request, history=None):
                     path = arguments.get('path') if isinstance(arguments, dict) else None
                     program_failures[path] = program_failures.get(path, 0) + 1
                 result = {"status": "error", "message": str(exc)}
+                if call.get('function', {}).get('name') == 'replace_text' and isinstance(arguments, dict):
+                    # Failed exact edits often come from stale or invented snippets.
+                    # Give the model the actual current source rather than asking it
+                    # to guess another replacement or regenerate the entire file.
+                    try:
+                        result['current_source'] = workspace.execute('read_lines', {
+                            'path': arguments['path'], 'max_lines': 150})
+                        result['repair_hint'] = 'Use an exact snippet from current_source for the next edit. Read further lines if needed.'
+                    except (ValueError, OSError, KeyError, TypeError):
+                        pass
                 if call.get('function', {}).get('name') == 'finish' and checks.suggested_check():
                     result['suggested_tool_call'] = checks.suggested_check()
                 if call.get('function', {}).get('name') == 'finish' and checks.failed_tests:

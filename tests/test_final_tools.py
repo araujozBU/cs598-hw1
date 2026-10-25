@@ -59,13 +59,95 @@ class FinalToolTests(unittest.TestCase):
 
     def test_search_pagination_and_line_ranges(self):
         (self.root / 'events.log').write_text('hit one\nhit two\n' + 'hit more\n' * 19 + 'last\n')
-        result = self.workspace.execute('search_file', {'path': 'events.log', 'query': 'hit', 'context_lines': 0})
+        result = self.workspace.execute('search_file', {'path': 'events.log', 'query': 'hit', 'context_lines': 0, 'max_matches': 20})
         self.assertTrue(result['truncated'])
         next_page = self.workspace.execute('search_file', {'path': 'events.log', 'query': 'hit', 'start_line': result['next_line']})
         self.assertEqual(next_page['matched_lines'], [21])
         result = self.workspace.execute('read_lines', {'path': 'events.log', 'start_line': 2, 'max_lines': 1})
         self.assertEqual(result['lines'][0]['text'], 'hit two')
         self.assertEqual(result['next_line'], 3)
+
+    def test_search_keeps_late_request_link_and_omits_surrounding_noise(self):
+        lines = []
+        for i in range(36):
+            lines.extend(['noise ' * 50] * 10 + [f'request=target diagnostic={i}'])
+        lines.append('request=target downstream=trace-required')
+        (self.root / 'events.log').write_text('\n'.join(lines))
+        result = self.workspace.execute('search_file', {'path': 'events.log', 'query': 'request=target', 'context_lines': 5})
+        self.assertFalse(result['truncated'])
+        self.assertTrue(result['context_omitted'])
+        self.assertEqual(len(result['matched_lines']), 37)
+        self.assertIn('downstream=trace-required', result['lines'][-1]['text'])
+        self.assertLess(len(json.dumps(result)), 8000)
+
+    def test_search_pagination_does_not_skip_matches_when_context_exceeds_budget(self):
+        (self.root / 'events.log').write_text(('x' * 10000 + '\nhit\n') * 5)
+        result = self.workspace.execute('search_file', {'path': 'events.log', 'query': 'hit', 'context_lines': 5, 'max_matches': 2})
+        self.assertEqual(result['matched_lines'], [2, 4])
+        self.assertTrue(result['truncated'])
+        next_result = self.workspace.execute('search_file', result['next_search'])
+        self.assertEqual(next_result['matched_lines'], [6, 8])
+        for number in result['matched_lines']:
+            self.assertTrue(any(line['line'] == number and line['text'] == 'hit' for line in result['lines']))
+
+    def test_undeclared_cli_options_fail_source_review_until_repaired(self):
+        checks = CompletionChecks(self.workspace, set(), True, programming_prompt='Implement app.py with --region and --until.')
+        source = "import argparse\np = argparse.ArgumentParser()\np.add_argument('rest', nargs='*')\na = p.parse_intermixed_args()\n"
+        result = checks.source_review(source, 'app.py')
+        self.assertEqual(result['missing_options'], ['--region', '--until'])
+        self.assertIn('app.py', checks.source_errors)
+        fixed = source.replace('a =', "p.add_argument('--region')\np.add_argument('--until')\na =") + 'print(a.region, a.until)\n'
+        self.assertIsNone(checks.source_review(fixed, 'app.py'))
+        self.assertFalse(checks.source_errors)
+
+    def test_cli_review_allows_dynamic_and_known_argument_parsers(self):
+        checks = CompletionChecks(self.workspace, set(), True, programming_prompt='Implement app.py with --region.')
+        for source in ["import argparse\np = argparse.ArgumentParser()\np.add_argument('rest')\np.parse_known_args()",
+                       "import argparse\np = argparse.ArgumentParser()\nflag = '--region'\np.add_argument(flag)\np.parse_args()"]:
+            with self.subTest(source=source):
+                self.assertIsNone(checks.source_review(source, 'app.py'))
+
+    def test_declared_option_must_be_used_by_command_handler(self):
+        checks = CompletionChecks(self.workspace, set(), True, programming_prompt='Implement app.py with --region.')
+        source = "import argparse\np = argparse.ArgumentParser()\np.add_argument('--region', dest='region_name')\na = p.parse_args()\nprint('all regions')\n"
+        result = checks.source_review(source, 'app.py')
+        self.assertEqual(result['unused_options'], {'--region': 'a.region_name'})
+        self.assertIsNone(checks.source_review(source.replace("'all regions'", 'a.region_name'), 'app.py'))
+        self.assertIsNone(checks.source_review(source.replace("print('all regions')", 'handle_options(a)'), 'app.py'))
+
+    def test_repeated_identical_mismatch_returns_to_repair_instead_of_review(self):
+        check = {'outputs_match': False, 'exit_code': 0, 'stdout': '4',
+                 'reference': {'exit_code': 0, 'stdout': '3'}, 'repeat_failure': True}
+        messages = [{'role': 'system', 'content': PROGRAMMING_PROMPT},
+                    {'role': 'user', 'content': 'Implement app.py.'},
+                    self.call('plan_program', interface='CLI', approach='calculate', checks=['output']),
+                    {'role': 'tool', 'tool_call_id': 'run', 'content': json.dumps(check)}]
+        with patch('agent.request_completion', return_value={'content': 'inspect source'}) as requested:
+            model_request(messages, time.monotonic() + 60)
+        self.assertIs(requested.call_args.args[0], messages)
+        self.assertNotIn('tool_choice', requested.call_args.kwargs)
+
+    def test_failed_exact_edit_returns_current_source_for_repair(self):
+        history = self.scripted('Implement answer.py that prints 4.', [
+            self.call('write_file', path='answer.py', content='print(3)'),
+            self.call('replace_text', path='answer.py', old='print(2)', new='print(4)'),
+            self.call('replace_text', path='answer.py', old='print(3)', new='print(4)'),
+            self.call('run_python', path='answer.py'),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        errors = [json.loads(m['content']) for m in history if m['role'] == 'tool' and 'current_source' in m['content']]
+        self.assertEqual(errors[0]['current_source']['lines'][0]['text'], 'print(3)')
+
+    def test_fixing_different_syntax_errors_preserves_local_progress(self):
+        history = self.scripted('Implement answer.py that prints 4.', [
+            self.call('write_file', path='answer.py', content='x =\ny =\nz =\nprint(4)\n'),
+            self.call('replace_text', path='answer.py', old='x =\n', new='x = 1\n'),
+            self.call('replace_text', path='answer.py', old='y =\n', new='y = 2\n'),
+            self.call('replace_text', path='answer.py', old='z =\n', new='z = 3\n'),
+            self.call('run_python', path='answer.py'),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        self.assertFalse(any('clean implementation' in m['content'] for m in history if m['role'] == 'tool'))
 
     def test_large_reads_and_csv_previews_are_bounded(self):
         (self.root / 'large.txt').write_text('a' * 100000)

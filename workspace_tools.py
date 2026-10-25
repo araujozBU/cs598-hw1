@@ -22,10 +22,11 @@ WORKSPACE_TOOLS = [
     definition('read_lines', 'Read a bounded range of numbered lines. Use for large files, source code, and TASK.md.',
                {'path': STRING, 'start_line': INTEGER, 'max_lines': INTEGER}, ['path']),
     definition('search_file', 'Search a file for an exact literal substring, returning numbered matching lines '
-               'and nearby context (up to 20 matches). Inspect ALL returned matches; an earlier success may be unrelated to a later failure. '
+               'and nearby context (default 100 matches, bounded output). Matching evidence takes priority over surrounding noise. '
+               'Inspect ALL returned matches; an earlier success may be unrelated to a later failure. '
                'If truncated, continue at next_line. Follow IDs across large logs with successive searches.',
                {'path': STRING, 'query': STRING, 'context_lines': {'type': 'integer', 'minimum': 0},
-                'start_line': INTEGER}, ['path', 'query']),
+                'start_line': INTEGER, 'max_matches': {'type': 'integer', 'minimum': 1, 'maximum': 200}}, ['path', 'query']),
     definition('run_python', 'Test a saved Python program directly. Example: {"path":"program.py","args":["count"]}. '
                'Do NOT use subprocess or paste a replacement implementation to test it. Execution is read-only: no file writes, network, '
                'subprocesses, or access to session history. stdout, stderr, exit code and timeout are returned. '
@@ -104,27 +105,41 @@ def execute_workspace(workspace, name, arguments):
     if not isinstance(query, str) or not query:
         raise ValueError('query must be a nonempty literal string.')
     context = integer(arguments, 'context_lines', 2, 0, 10)
-    maximum = 20
+    maximum = integer(arguments, 'max_matches', 100, 1, 200)
     # Reading locally is cheap; only bounded search results enter model context.
     lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
-    matches, selected, size, truncated, next_line = [], {}, 0, False, None
-    for index in range(start - 1, len(lines)):
-        if query not in lines[index]:
-            continue
-        if len(matches) >= maximum or size >= TEXT_LIMIT:
-            truncated, next_line = True, index + 1
+    candidates = [i for i in range(start - 1, len(lines)) if query in lines[i]]
+    selected, size = {}, 0
+    # Reserve the budget for matches FIRST. Context around earlier matches must
+    # never hide later links in the same request's evidence chain.
+    for index in candidates[:maximum]:
+        if selected and size + len(lines[index]) > TEXT_LIMIT:
             break
-        matches.append(index + 1)
-        for nearby in range(max(0, index - context), min(len(lines), index + context + 1)):
+        selected[index + 1] = lines[index][:TEXT_LIMIT - size]
+        size += len(selected[index + 1])
+    matches = list(selected)
+    truncated = len(matches) < len(candidates)
+    next_line = candidates[len(matches)] + 1 if truncated else None
+    context_omitted = bool(context and len(candidates) > 20)
+    if context_omitted:
+        context = 0  # Broad searches return evidence, not hundreds of noisy neighbors.
+    for number in matches:
+        for nearby in range(max(0, number - 1 - context), min(len(lines), number + context)):
             if nearby + 1 in selected:
                 continue
-            if size >= TEXT_LIMIT:
-                truncated, next_line = True, index + 1
-                break
-            selected[nearby + 1] = lines[nearby][:TEXT_LIMIT - size]
-            size += len(selected[nearby + 1])
-    return {'matched_lines': matches, 'lines': [{'line': n, 'text': s} for n, s in sorted(selected.items())],
-            'truncated': truncated, 'next_line': next_line}
+            if size + len(lines[nearby]) > TEXT_LIMIT:
+                context_omitted = True
+                continue
+            selected[nearby + 1] = lines[nearby]
+            size += len(lines[nearby])
+    result = {'matched_lines': matches,
+              'lines': [{'line': n, 'text': s, 'line_truncated': len(s) < len(lines[n - 1])}
+                        for n, s in sorted(selected.items())],
+              'truncated': truncated, 'next_line': next_line, 'context_omitted': context_omitted}
+    if truncated:
+        result['next_search'] = {**arguments, 'start_line': next_line}
+        result['hint'] = 'Matching evidence remains unread. Continue this same search before drawing conclusions from missing links.'
+    return result
 
 
 def run_python(workspace, arguments):

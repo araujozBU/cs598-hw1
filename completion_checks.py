@@ -34,7 +34,7 @@ def scalar_money_commands(prompt):
 
 class CompletionChecks:
     def __init__(self, workspace, outputs, programming, report_prompt='', validate_json=False, integer_array=False,
-                 money_commands=()):
+                 money_commands=(), programming_prompt=''):
         self.workspace = workspace
         self.outputs = outputs
         self.programming = programming
@@ -51,6 +51,8 @@ class CompletionChecks:
         self.valid_integer_args = {}
         self.money_commands = set(money_commands)
         self.money_zero_pending = set(money_commands)
+        self.required_options = set(re.findall(r'(?<![\w-])--[A-Za-z][\w-]*', programming_prompt))
+        self.source_errors = {}
 
     def output_error(self, arguments, result):
         command = next((arg for arg in arguments.get('args', []) if arg in self.money_commands), None)
@@ -78,9 +80,69 @@ class CompletionChecks:
                 for item in self.failed_tests.values()]
 
     def source_review(self, source, path):
+        tree = ast.parse(source)
+        self.source_errors.pop(path, None)
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+        # Only diagnose a statically declared argparse interface. Custom parsers,
+        # dynamic declarations and parse_known_args may intentionally handle flags elsewhere.
+        attributes = {node.func.attr for node in calls if isinstance(node.func, ast.Attribute)}
+        declarations = [node for node in calls if isinstance(node.func, ast.Attribute)
+                        and node.func.attr == 'add_argument']
+        if (self.required_options and declarations and 'ArgumentParser' in attributes
+                and attributes.intersection({'parse_args', 'parse_intermixed_args'})
+                and not attributes.intersection({'parse_known_args', 'parse_known_intermixed_args'})
+                and all(node.args and all(isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                                          for arg in node.args) for node in declarations)
+                and 'REMAINDER' not in source):
+            declared = {arg.value for node in declarations for arg in node.args if arg.value.startswith('--')}
+            missing = sorted(self.required_options - declared)
+            if missing:
+                error = ('The specification requires CLI options that this argparse parser never declares: '
+                            + ', '.join(missing) + '. A positional argument with nargs="*" does not accept unknown --options. '
+                            'Declare every option with add_argument, choose safe dest names for Python keywords, '
+                            'and read the parsed attributes in the command handlers.')
+                self.source_errors[path] = error
+                return {'validation_error': error,
+                        'missing_options': missing,
+                        'parser_source': [ast.get_source_segment(source, node) for node in declarations]}
+            parsed = [node for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                      and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                      and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute)
+                      and node.value.func.attr in ('parse_args', 'parse_intermixed_args')]
+            for assignment in parsed:
+                namespace = assignment.targets[0].id
+                parser = ast.dump(assignment.value.func.value)
+                # Passing the whole namespace to a helper, vars(), or getattr()
+                # can consume options indirectly; do not guess in that case.
+                if any(any(isinstance(arg, ast.Name) and arg.id == namespace for arg in node.args)
+                       or any(isinstance(kw.value, ast.Name) and kw.value.id == namespace for kw in node.keywords)
+                       for node in calls):
+                    continue
+                used = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+                        and isinstance(node.value, ast.Name) and node.value.id == namespace
+                        and isinstance(node.ctx, ast.Load)}
+                unused = {}
+                for declaration in declarations:
+                    if ast.dump(declaration.func.value) != parser:
+                        continue
+                    options = [arg.value for arg in declaration.args if arg.value.startswith('--')]
+                    if not options:
+                        continue
+                    keywords = {kw.arg: kw.value for kw in declaration.keywords}
+                    if 'action' in keywords and isinstance(keywords['action'], ast.Constant) and keywords['action'].value in ('help', 'version'):
+                        continue
+                    dest = keywords.get('dest', ast.Constant(options[0][2:].replace('-', '_')))
+                    if isinstance(dest, ast.Constant) and isinstance(dest.value, str) and dest.value not in used:
+                        unused.update({option: f'{namespace}.{dest.value}' for option in options if option in self.required_options})
+                if unused:
+                    error = ('Required options are declared but their parsed values are never read: '
+                             + json.dumps(unused) + '. argparse removes declared options from positional arguments. '
+                             'Update the command handlers to use these named attributes; scanning the positional list '
+                             'for the option names cannot work.')
+                    self.source_errors[path] = error
+                    return {'validation_error': error, 'unused_options': unused}
         if not self.integer_array:
             return None
-        tree = ast.parse(source)
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Name) and node.func.id == 'isinstance' and len(node.args) == 2]
         if any(isinstance(node.args[1], ast.Name) and node.args[1].id == 'bool' for node in calls):
@@ -122,7 +184,11 @@ class CompletionChecks:
             # Keep a failed comparison pending even if a later invocation only
             # checks the exit code or a different command happens to work.
             previous = self.failed_tests.get(key, {})
+            signature = (result.get('stdout'), result.get('stderr'),
+                         result.get('reference', {}).get('stdout'), result.get('reference', {}).get('stderr'))
+            result['repeat_failure'] = previous.get('signature') == signature
             self.failed_tests[key] = {
+                'signature': signature,
                 'requires_reference': compared or previous.get('requires_reference', False),
                 'arguments': {**arguments, 'path': str(self.workspace.file_path(arguments['path']).relative_to(self.workspace.root))}}
             self.untested.add(path)
@@ -165,6 +231,8 @@ class CompletionChecks:
                             return f'{name}: field {key} has no inspected log evidence. Read/search its source and copy the value exactly.'
         if self.programming and not any(path.endswith('.py') for path in self.written):
             return 'Implement and test the requested Python source before reporting success; inspection alone is insufficient.'
+        if self.source_errors:
+            return 'Repair the source interface before finishing: ' + json.dumps(self.source_errors)
         if self.failed_tests:
             return ('Rerun and resolve every failed saved-program check before finishing. '
                     'Use the exact arguments AND stdin below. For a failed reference comparison, correct the program '
