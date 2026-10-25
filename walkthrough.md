@@ -62,6 +62,13 @@ success result without a prior successful file operation in independent mode.
 Session mode also permits answers from earlier context and acknowledgment of
 instructions that do not require a file operation.
 
+Session mode also accepts a plain-text final answer and wraps it in the required
+JSON locally. Previously, a formatting retry could replace a correct answer
+such as "Cedar" with "Task completed successfully." Preserving the original
+answer avoids that extra model call. Stored assistant history contains the
+answer itself, rather than the CLI status object. Malformed structured replies
+and success claims following a failed tool operation still require correction.
+
 ## What the checks establish
 
 Python directly checks paths, argument types, JSON output, and the time limit.

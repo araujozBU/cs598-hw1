@@ -14,6 +14,7 @@ library. No agent SDK or additional Python packages are required.
 - `tests/test_agent.py`: generated test inputs, expected results, offline checks, and optional live tests.
 - `tests/test_sessions.py`: separate-process persistence and session isolation checks with a scripted model.
 - `tests/test_csv.py`: CSV checks and optional live Checkpoint 2 conversations.
+- `tests/test_memory_regressions.py`: reported memory-recall and session-isolation failures, tested offline and live.
 - `walkthrough.md`: a step-by-step explanation of the harness and an example request.
 
 Development environment: macOS with Python 3.13.7. Linux has not yet been tested.
@@ -101,7 +102,7 @@ Run offline checks from the submission folder:
 python3 -m unittest discover -s tests -v
 ```
 
-There are 27 offline tests and 13 optional live tests. To run only the three live
+There are 32 offline tests and 15 optional live tests. To run only the three live
 Checkpoint 2 conversations (10 separate agent invocations, sequentially):
 
 ```bash
@@ -109,10 +110,44 @@ RUN_CHECKPOINT2_LIVE_TESTS=1 python3 tests/test_csv.py Checkpoint2LiveTests -v
 ```
 
 These cover sum/average/copy, interleaved sessions, and row arithmetic/update/filter.
+
+### Conversational memory regression tests
+
+The grading report exposed a plain-text response handling bug: Qwen answered the
+memory question correctly, but a harness retry replaced it with a generic task
+confirmation. The regression tests reproduce this response sequence and verify
+that the requested fact reaches the final JSON `message`.
+
+Run the five offline regression tests, with no API key required:
+
+```bash
+python3 tests/test_memory_regressions.py MemoryRegressionTests -v
+```
+
+With the API environment configured, run the exact reported conversations:
+
+```bash
+RUN_CHECKPOINT2_LIVE_TESTS=1 python3 tests/test_memory_regressions.py MemoryLiveTests -v
+```
+
+These live tests remember Cedar in session 6101, and Harbor/Meadow in sessions
+6404/6405, then check recall in separate agent processes. Each case uses a fresh
+workspace and also checks preservation of an unrelated binary file and empty
+directory. The offline tests additionally cover quotes/Unicode, final history
+content, and plain text following a failed file operation. All are included in
+the full suite, with live tests controlled by the existing Checkpoint 2 flag.
+
+Session mode now accepts a plain-text final answer and places it in `message`
+without a formatting retry. The harness still prints only the required JSON.
+History stores the answer text instead of the CLI status object. If a correction
+is needed, the retry explicitly asks to preserve the requested answer and facts.
+
 The Checkpoint 2 submission archive is `hw1-2.zip`. It includes the complete
 updated framework, documentation, and tests. Generated session histories,
 credentials, caches, and temporary workspaces are excluded. The older `hw1-1.zip`
 is the previous checkpoint's snapshot and does not include these updates.
+The existing ZIPs predate the memory-recall fix and regression tests; repackage
+the current source before using an archive that includes that fix.
 Checkpoint 2 uses `submit hw1-2`, due October 11, 2026, at 11:59 p.m. Eastern.
 
 ## How it works
@@ -121,7 +156,8 @@ The harness sends the prompt and tool definitions to `/chat/completions`. Qwen
 requests `read_file`, `write_file`, or `delete_file`; Python validates and executes
 each operation and returns its result to Qwen. The model calls `finish` with the
 final status and answer. The harness also accepts a strictly validated JSON final
-result if the endpoint renders completion as text. Without a session ID, success
+result if the endpoint renders completion as text. It also preserves plain-text
+session answers in `message` and stores answer text in history. Without a session ID, success
 requires prior successful tool execution in that call. Session turns may answer
 from remembered context or acknowledge an instruction without a new file operation.
 
@@ -144,7 +180,7 @@ local and live tests from the submission folder:
 RUN_LIVE_TESTS=1 RUN_EXTENDED_LIVE_TESTS=1 RUN_CHECKPOINT2_LIVE_TESTS=1 python3 -m unittest discover -s tests -v
 ```
 
-Expect `Ran 40 tests` and `OK`, with no skipped tests when all three flags are set.
+Expect `Ran 47 tests` and `OK`, with no skipped tests when all three flags are set.
 Each live case invokes the Bash launcher from a fresh workspace, as the grader
 does. These are our own cases, not the hidden grading tests. Review the summaries
 printed by the tests as well as the automated result.

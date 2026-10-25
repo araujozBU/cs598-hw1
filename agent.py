@@ -28,6 +28,9 @@ Tool errors mean that operation failed; correct the call if possible, otherwise
 finish with status error. Never claim an operation succeeded without tool evidence.
 When done, call finish with status success or error and a message. For questions,
 the message must contain the answer. Do not ask the user questions or await input.
+For conversational memory questions or acknowledgments in session mode, a direct
+plain-text answer is also accepted. Include the requested facts, not merely a
+generic task-completion statement.
 In session mode, use the earlier conversation to resolve references to files,
 columns, values, results, and instructions. You may answer directly from relevant
 history or acknowledge an instruction without a file operation. Read files again
@@ -177,7 +180,9 @@ def run_agent(prompt, workspace, request=model_request, history=None):
         if finish_tool:
             # Store the final answer as text, avoiding an unmatched finish call.
             messages.pop()
-        messages.append({"role": "assistant", "content": json.dumps(result, ensure_ascii=False)})
+        # The CLI owns the JSON envelope. Store the actual answer in history so
+        # later turns see conversational content rather than status objects.
+        messages.append({"role": "assistant", "content": result["message"]})
         if history is not None:
             history[:] = messages[1:]
         return result
@@ -192,9 +197,10 @@ def run_agent(prompt, workspace, request=model_request, history=None):
             print(json.dumps({"tools": [call.get("function", {}).get("name") for call in calls],
                               "text": response.get("content") if not calls else None}), file=sys.stderr)
         if not calls:
-            # Some endpoint responses render finish as text instead of a tool call.
-            # Accept only the exact result schema, with evidence of tool execution.
+            # Preserve a session's plain-text answer without another model call.
+            # The CLI will serialize it into the required JSON message field.
             content = (response.get("content") or "").strip()
+            structured = content.startswith(("finish\n", "{", "[", "```"))
             if content.startswith("finish\n"):
                 content = content[len("finish\n"):].strip()
             try:
@@ -203,8 +209,16 @@ def run_agent(prompt, workspace, request=model_request, history=None):
                     return complete(result)
             except (ValueError, TypeError):
                 pass
+            if session_mode and content and not structured and not last_operation_failed:
+                return complete({"status": "success", "message": content})
             messages.append({"role": "assistant", "content": response.get("content") or ""})
-            messages.append({"role": "user", "content": "Use the tools to complete the task, then call finish."})
+            messages.append({"role": "user", "content": (
+                "If the request requires a file operation, execute it and check the result. "
+                "Then call finish with status and message. For a question, put the actual "
+                "answer and all requested facts in message, preserving any answer you "
+                "already gave. Do not replace an answer with a generic completion statement. "
+                "If an operation failed and cannot be corrected, finish with status error."
+            )})
             continue
         messages.append({"role": "assistant", "content": response.get("content"), "tool_calls": calls})
         for call in calls:
