@@ -12,7 +12,7 @@ changing the working directory. This matters: the code lives in the submission,
 but the files it works on live in the task directory.
 
 `main()` reads `sys.argv[1]`, constructs `Workspace(Path.cwd())`, and starts the
-170-second timer. It also catches failures so they produce the required JSON.
+290-second timer. It also catches failures so they produce the required JSON.
 
 ## 2. Tell Qwen what it can do
 
@@ -26,7 +26,7 @@ and passes that summary to `write_file`.
 
 ## 3. Send the conversation to the model
 
-`model_request()` reads the endpoint, model name, and key from the environment.
+`model_request()` delegates to `model_client.py`, which reads the endpoint, model name, and key from the environment.
 It sends an HTTP POST to `/chat/completions`, including the conversation and tool
 definitions. It turns connection problems and invalid responses into errors the
 entry point can report. The key is an HTTP authorization header, not part of the
@@ -44,7 +44,7 @@ Suppose the request is: "Read inventory.txt. How many blue notebooks are in stoc
 5. Qwen calls `finish` with, for example,
    `{"status":"success","message":"There are 12 blue notebooks in stock."}`.
 
-The repeated exchange is implemented by `run_agent()`. It allows up to 16 model
+The repeated exchange is implemented by `run_agent()`. It allows up to 120 model
 turns. Calls without a session ID start a new conversation. With a session ID,
 previous turns are loaded from workspace-local storage before the new prompt is
 appended, and completed turns are saved for the next process.
@@ -101,3 +101,31 @@ Session IDs are isolated within each workspace. The model cannot use its file
 tools to read or modify the reserved `.agent_sessions` directory. Task data files
 remain shared within the workspace; separate conversation history does not create
 a separate filesystem for each session.
+
+## Checkpoint 3 additions
+
+The model receives generic tools for listing files, reading numbered line ranges,
+and searching literal identifiers in large logs. File and CSV previews are bounded
+so entire large inputs need not enter the model context. Independent calculations
+can run in `analyze_python`. Generated source is written with `write_file` and
+exercised directly with `run_python`, supplying the filename, arguments, and stdin.
+Tests may supply an independent reference calculation and an expected exit code. Small fixes use
+`replace_text` to replace a unique snippet without rewriting the entire file.
+The latter runs the saved file rather than a replacement snippet. Every edited
+Python file in a programming task must be tested again before success is accepted.
+
+The Python child has a read-only audit guard, timeout, bounded output and no API
+credentials. Network calls, subprocesses, writes and session reads are blocked.
+This is a guard for ordinary generated code, not an adversarial security sandbox.
+
+`model_client.py` assembles streaming text and fragmented tool calls before the
+loop executes them. It explicitly disables thinking on every request, handles
+bounded retries for transient HTTP errors, and reports incomplete output as an
+error. Each invocation permits at most 120 successful completions and has a
+290-second alarm, below the final assignment's 300-second limit.
+
+The final live tests generate fresh 40,000-row CSV data and noisy service logs,
+then check generated deliverables against independent expected results. Alternate
+identifiers and a different programming problem check that the framework is not
+merely emitting one memorized solution. The unpublished grading requirements
+remain unknown; passing local tests cannot establish a guaranteed grade.

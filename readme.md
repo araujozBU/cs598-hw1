@@ -1,4 +1,4 @@
-# CS598 Homework 1 — File and CSV agent
+# CS598 Homework 1 — Programming, debugging, file and CSV agent
 
 This agent implements its own Qwen tool-calling loop using only Python's standard
 library. No agent SDK or additional Python packages are required.
@@ -6,8 +6,12 @@ library. No agent SDK or additional Python packages are required.
 ## Requirements and files
 
 - Python 3.10 or later and Bash on Linux or macOS.
+- `requirements.txt`: documents that no third-party packages are required; no installation step is needed.
 - `run_agent.sh`: entry point; resolves source code relative to itself and preserves the task working directory.
-- `agent.py`: model requests, tool definitions, workspace operations, and final JSON output.
+- `agent.py`: tool loop, workspace operations, completion checks, and final JSON output.
+- `model_client.py`: streaming Chat Completions client with thinking disabled.
+- `workspace_tools.py`: bounded log/source inspection and Python execution tools.
+- `python_runner.py`: read-only execution guard for generated Python and analysis snippets.
 - `sessions.py`: persistent conversation history and locking, isolated by workspace and session ID.
 - `csv_tools.py`: CSV reading, decimal calculations, updates, filtering, and copying.
 - `scripts/test_connection.py`: one small endpoint connectivity check.
@@ -15,9 +19,14 @@ library. No agent SDK or additional Python packages are required.
 - `tests/test_sessions.py`: separate-process persistence and session isolation checks with a scripted model.
 - `tests/test_csv.py`: CSV checks and optional live Checkpoint 2 conversations.
 - `tests/test_memory_regressions.py`: reported memory-recall and session-isolation failures, tested offline and live.
+- `tests/test_final_tools.py`: inspection, execution, streaming, limits, and completion regressions.
+- `tests/test_final_live.py`: generated programs and reports checked against independent expected results.
+- `tests/final_fixtures.py` and `tests/fixtures/`: reproducible synthetic inputs and task prompts.
+- `scripts/prepare_final_fixture.py`: creates a manual final-checkpoint workspace.
+- `scripts/run_tests.py`: offline or full live suite, with spacing between live turns.
 - `walkthrough.md`: a step-by-step explanation of the harness and an example request.
 
-Development environment: macOS with Python 3.13.7. Linux has not yet been tested.
+Tested environment: macOS 15.7.3 with Python 3.13.7. Linux has not yet been tested.
 
 ## Run
 
@@ -52,7 +61,7 @@ each other's histories, and history saves use an atomic replacement.
 
 Calls without an ID retain Checkpoint 1 behavior: a fresh conversation and no
 session storage. Each call still emits exactly one JSON result within its own
-170-second limit. Corrupt history produces an error instead of silently losing
+290-second limit. Corrupt history produces an error instead of silently losing
 the conversation. Keep generated session directories out of submissions.
 
 CSV tools use Python's `csv` module and `Decimal` arithmetic. Supported operations
@@ -102,7 +111,7 @@ Run offline checks from the submission folder:
 python3 -m unittest discover -s tests -v
 ```
 
-There are 32 offline tests and 15 optional live tests. To run only the three live
+The complete suite has 55 offline tests and 19 optional live tests, including final-checkpoint checks. To run only the three live
 Checkpoint 2 conversations (10 separate agent invocations, sequentially):
 
 ```bash
@@ -142,13 +151,168 @@ without a formatting retry. The harness still prints only the required JSON.
 History stores the answer text instead of the CLI status object. If a correction
 is needed, the retry explicitly asks to preserve the requested answer and facts.
 
-The Checkpoint 2 submission archive is `hw1-2.zip`. It includes the complete
-updated framework, documentation, and tests. Generated session histories,
-credentials, caches, and temporary workspaces are excluded. The older `hw1-1.zip`
-is the previous checkpoint's snapshot and does not include these updates.
-The existing ZIPs predate the memory-recall fix and regression tests; repackage
-the current source before using an archive that includes that fix.
-Checkpoint 2 uses `submit hw1-2`, due October 11, 2026, at 11:59 p.m. Eastern.
+The old `hw1-1.zip` and `hw1-2.zip` archives are earlier snapshots and do not
+contain the current fixes. Use the final `hw1-3.zip` archive after packaging the
+current source. Never submit generated session histories or credentials.
+
+## Checkpoint 3: programming and debugging
+
+The same loop handles new programming and debugging prompts. Programming
+requests use a focused system prompt with general implementation/testing guidance. It has no built-in
+`tally.py` solution, incident IDs, or expected report values. Those are confined
+to test fixtures. `list_files`, `read_lines`, and `search_file` inspect the actual
+workspace; `write_file` creates the requested deliverable. `replace_text` makes
+a unique, exact snippet replacement for a small source correction while preserving
+all other file bytes. Edited Python source must be tested again. After repeated
+failed program runs, the agent must replace the full source rather than continue
+an ineffective sequence of small patches. Search returns up to
+20 matches with context and a continuation line for larger results. The agent is
+instructed to follow the failed incident's identifiers and check all matches,
+including later failures following successful attempts.
+
+`run_python` executes a saved program with arguments and optional stdin.
+An optional `reference_code` runs an independent Python calculation against the
+same inputs and compares its actual stdout with the saved program's stdout.
+Both results and `outputs_match` are returned; an incorrect reference never
+erases the program's output. This avoids asking the model to guess or manually
+transcribe expected totals. Independent live tests still fail on any incorrect
+output. Explicit requests to print compact JSON also receive a format check.
+`analyze_python` executes a short snippet for independent calculations or report
+validation. A programming task cannot report success until every Python source
+file it wrote has been run with the expected exit code after its last edit. This is a minimum
+completion check, not proof of program correctness; live tests separately compare
+outputs with expected results on multiple inputs.
+
+Execution uses a separate Python process, an environment without the API key,
+and a read-only audit guard. Normal file writes, network calls, subprocesses,
+and access to session history are blocked. Standard-library imports and workspace
+input reads are allowed. Each execution has a maximum 30-second timeout and
+bounded output. Invalid-input checks can specify a nonzero `expected_exit_code`. This guard is not a security sandbox for intentionally hostile
+Python. Generated programs that require filesystem writes cannot be fully
+exercised through this read-only tool. The supplied spending CLI needs only reads.
+
+Requests use streaming responses, disable parallel tool calls to encourage
+checking each result before the next action, set `chat_template_kwargs.enable_thinking=false`,
+and at most 120 successful completions per invocation. The overall 290-second
+timer leaves margin below the final checkpoint's 300-second limit. Transient HTTP
+429/502/503/504 responses receive at most two retries within that timer. Large
+file reads and CSV previews are bounded; calculations still use the full CSV.
+Older large tool results are shortened when conversation text grows. This is a
+character-based context heuristic, not an exact Qwen tokenizer count. Large
+inputs above 40,000 bytes receive an 8,000-byte preview through `read_file`;
+files within the earlier checkpoint's 40,000-byte allowance remain complete.
+Programming prompts receive a bounded workspace inventory and CSV preview with
+the actual row count and sums of numeric columns, so illustrative example numbers are less likely to be
+confused with the supplied data. Rejected malformed tool arguments are stored
+as valid JSON in history so they cannot break the next API request.
+Programming requests use temperature 0.7 and top-p 0.8, following the non-thinking
+sampling recommendation in the [Qwen model card](https://huggingface.co/Qwen/Qwen3-14B#best-practices).
+Other requests retain temperature 0. Thinking remains disabled in every request.
+
+The live final tests include a 40,000-row spending CSV (quoted commas, refunds,
+mixed category case, ties, date boundaries, alternate input paths), a different
+sliding-window programming problem, and two noisy four-service log incidents
+with different identifiers and causal classes. Tests check exact outputs, JSON
+keys/types, and preservation of all supplied inputs and unrelated files. The six
+unpublished programming requirements and six unpublished report fields are not
+available: our extra report fields are clearly labeled local examples, not claims
+about the hidden grader. Full runtime prompts remain authoritative.
+
+### Manual final tests, without a test helper or assertions
+
+First configure Bash, `submission_dir`, and the API environment using the setup
+block under **Manual console tests without a helper function** below. Keep
+`submission_dir` pointing to the folder containing `run_agent.sh`, not a temporary
+workspace. The preparation script only writes synthetic input files; the agent
+is then invoked directly, as it is by the grader.
+
+Programming:
+
+```bash
+task_dir="$(mktemp -d)"
+python3 "$submission_dir/scripts/prepare_final_fixture.py" programming "$task_dir"
+cd "$task_dir"
+cat TASK.md
+bash "$submission_dir/run_agent.sh" "$(cat TASK.md)" 9101
+echo "Exit code: $?"
+python3 tally.py count
+python3 tally.py total
+python3 tally.py total --category fOoD
+python3 tally.py top 2
+python3 tally.py range --from 2026-09-02 --to 2026-09-03
+```
+
+Expected program output, in command order: `40000`, `250000.00`, `100000.00`,
+then two lines `food<TAB>100000.00` and `travel<TAB>100000.00`, then
+`count=20000 total=97500.00`. Inspect `tally.py` if any result differs. Check a new
+input to ensure the code did not memorize the fixture:
+
+```bash
+printf 'date,description,category,amount\n2026-01-01,"A, B",Other,-3.00\n' > custom.csv
+python3 tally.py total --file custom.csv
+python3 tally.py top --file custom.csv 8
+```
+
+Expected: `-3.00`, then `other<TAB>-3.00`.
+
+Debugging:
+
+```bash
+task_dir="$(mktemp -d)"
+python3 "$submission_dir/scripts/prepare_final_fixture.py" debugging "$task_dir"
+cd "$task_dir"
+cat TASK.md
+bash "$submission_dir/run_agent.sh" "$(cat TASK.md)" 9102
+echo "Exit code: $?"
+cat REPORT.json
+printf '\n'
+```
+
+Compare the report with the expected object printed by the preparation command.
+That object is not written into the agent's workspace. Inspect the evidence:
+
+```bash
+grep 'ORD-77341' logs/gateway.log
+grep 'gw-8417' logs/gateway.log
+grep 'tr-aa11bb22' logs/orders.log
+grep 'hold-6543' logs/inventory.log
+grep 'pi_test_main271' logs/payments.log
+```
+
+The first matching order line is a successful decoy; the failed request must be
+traced through its own identifiers. The expected causal class is `LeaseRegistry`.
+Repeat in another fresh directory with `debugging-alternate` to test different
+identifiers and the causal class `ReservationIndex`.
+
+### Recheck the reported Part 2 failures directly
+
+Keep the API configuration and `submission_dir` from setup. Paste these commands
+in order; no CSV file or file operation is involved:
+
+```bash
+task_dir="$(mktemp -d)"
+cd "$task_dir"
+bash "$submission_dir/run_agent.sh" 'My project code name is Cedar. Remember it for this conversation.' 6101
+bash "$submission_dir/run_agent.sh" 'What is my project code name?' 6101
+bash "$submission_dir/run_agent.sh" 'My project code name is Harbor. Remember it for this conversation.' 6404
+bash "$submission_dir/run_agent.sh" 'My project code name is Meadow. Remember it for this conversation.' 6405
+bash "$submission_dir/run_agent.sh" 'What is my project code name?' 6404
+bash "$submission_dir/run_agent.sh" 'What is my project code name?' 6405
+```
+
+The recall messages must actually contain **Cedar**, **Harbor**, and **Meadow**
+for their respective sessions. A generic completion message is a failure even if
+the status says success.
+
+### Submission
+
+Submit the complete updated framework using the course Slack command
+`submit hw1-3`, due October 25, 2026 at 23:59:59 Eastern. The final archive must
+have `run_agent.sh` at its root, all Python modules, documentation, test fixtures,
+and expected results. No package installation is needed because every dependency
+is in the Python standard library. Exclude credentials, old ZIPs, session history,
+caches, virtual environments, and generated task workspaces. Both earlier
+checkpoints are regraded on this final source.
 
 ## How it works
 
@@ -163,9 +327,9 @@ from remembered context or acknowledge an instruction without a new file operati
 
 Paths must stay within the task workspace. Symlinks are rejected, writes use
 UTF-8 without automatic newlines, missing parent directories are created, and
-deletion never removes directories. The harness uses a 170-second overall timer
-and at most 16 model turns. It disables thinking as in the course quick start.
-Each response is capped at 4,096 output tokens; oversized responses fail explicitly.
+deletion never removes directories. The harness uses a 290-second overall timer
+and at most 120 model calls. It disables thinking as in the course quick start.
+Each response is capped at 8,192 output tokens; oversized responses fail explicitly.
 Set `AGENT_DEBUG=1` to emit model completion text, tool names, and tool errors to
 stderr for troubleshooting; this can include task data.
 
@@ -177,10 +341,13 @@ After setting your API key as shown in the manual walkthrough below, run all
 local and live tests from the submission folder:
 
 ```bash
-RUN_LIVE_TESTS=1 RUN_EXTENDED_LIVE_TESTS=1 RUN_CHECKPOINT2_LIVE_TESTS=1 python3 -m unittest discover -s tests -v
+python3 scripts/run_tests.py --live
 ```
 
-Expect `Ran 47 tests` and `OK`, with no skipped tests when all three flags are set.
+Expect `Ran 74 tests` and `OK`, with no skipped tests. This command enables all
+four live-test flags and spaces separate agent invocations by 10 seconds to reduce
+rate limits on the shared endpoint. It can take several minutes. For offline-only
+checks use `python3 scripts/run_tests.py`; 19 live cases will be skipped.
 Each live case invokes the Bash launcher from a fresh workspace, as the grader
 does. These are our own cases, not the hidden grading tests. Review the summaries
 printed by the tests as well as the automated result.
@@ -210,7 +377,8 @@ multiple requested facts, missing source, and a 40,000-byte summary input):
 RUN_EXTENDED_LIVE_TESTS=1 python3 tests/test_agent.py ExtendedLiveTests -v
 ```
 
-The three live-test flags are independent. Set all three for the full suite.
+The four live-test flags are independent. `RUN_FINAL_LIVE_TESTS=1` enables the
+new generation tasks; `scripts/run_tests.py --live` enables all four groups.
 Live tests use the shared GPU sequentially; prefer offline tests during routine
 development and use live cases when checking model behavior.
 
@@ -220,9 +388,10 @@ of 12 notebooks, and summary facts and word count. The summary is printed to
 stderr for human review of accuracy and clarity; keyword checks alone do not
 fully evaluate summary quality. Temporary workspaces are cleaned up afterwards.
 
-This is an initial test set, not yet a comprehensive grading-readiness suite.
+These tests exercise the public requirements and additional regressions, but do
+not include the course's unpublished cases.
 Keep credentials, caches, virtual environments, and test workspaces out of the
-submission. No dependency installation file is necessary for standard-library-only code.
+submission. `requirements.txt` intentionally lists no third-party dependencies.
 
 ## Manual console tests without a helper function
 
@@ -482,7 +651,7 @@ assert all(isinstance(value, str) for value in result.values()), 'Both fields mu
 assert result['status'] in ('success', 'error'), 'Invalid status'
 assert result['status'] == expected, result
 assert (code == 0) == (expected == 'success'), 'Incorrect exit code'
-assert elapsed < 180, 'Time limit exceeded'
+assert elapsed < 300, 'Final-checkpoint time limit exceeded'
 print('PASS: JSON, exit code, and elapsed time. Inspect task results next.')
 PY
 }

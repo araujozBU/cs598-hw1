@@ -14,7 +14,8 @@ def definition(name, description, properties, required):
 
 STRING = {'type': 'string'}
 CSV_TOOLS = [
-    definition('read_csv', 'Read the header and all rows of a CSV table without modifying it.',
+    definition('read_csv', 'Read CSV header, row count, and a bounded preview (up to 100 rows). '
+               'For large-table calculations use calculate_csv or analyze_python, not the preview.',
                {'path': STRING}, ['path']),
     definition('calculate_csv',
                'Calculate a column sum or average, or add specified columns in one row identified by its ID. '
@@ -99,7 +100,14 @@ def execute_csv(workspace, name, arguments):
         raise ValueError('CSV arguments other than columns must be strings.')
     raw, headers, rows = read_table(workspace, arguments['path'])
     if name == 'read_csv':
-        return {'columns': headers, 'rows': rows, 'row_count': len(rows)}
+        preview, size = [], 0
+        for row in rows[:100]:
+            size += sum(len(cell) for cell in row)
+            if size > 24000:
+                break
+            preview.append(row)
+        return {'columns': headers, 'rows': preview, 'row_count': len(rows),
+                'truncated': len(preview) < len(rows)}
     if name == 'copy_csv':
         workspace.write_bytes(arguments['output_path'], raw)
         return {'written': arguments['output_path'], 'row_count': len(rows)}
