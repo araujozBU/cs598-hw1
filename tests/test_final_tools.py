@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from agent import AgentError, MAX_MODEL_CALLS, PROGRAMMING_PROMPT, Workspace, model_request, run_agent
+from agent import AgentError, MAX_MODEL_CALLS, PROGRAMMING_PROMPT, Workspace, is_programming_request, model_request, run_agent
 from model_client import parse_completion, request_completion
 from completion_checks import CompletionChecks
 
@@ -31,6 +31,31 @@ class FinalToolTests(unittest.TestCase):
         self.assertEqual(result['matched_lines'], [20001])
         self.assertIn('LockTable', json.dumps(result))
         self.assertLess(len(json.dumps(result)), 1000)
+
+    def test_programming_word_in_memory_is_not_a_programming_task(self):
+        history = []
+        answer = 'I will remember the word implement.'
+        def request(messages, deadline):
+            self.assertNotEqual(messages[0]['content'], PROGRAMMING_PROMPT)
+            return {'content': answer}
+        result = run_agent('Remember the word implement for this conversation.',
+                           self.workspace, request=request, history=history)
+        self.assertEqual(result, {'status': 'success', 'message': answer})
+        self.assertEqual(history[-1]['content'], answer)
+
+    def test_programming_word_in_text_filename_does_not_require_python(self):
+        self.scripted('Create notes/implement.txt containing exactly Hello.', [
+            self.call('write_file', path='notes/implement.txt', content='Hello'),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        self.assertEqual((self.root / 'notes/implement.txt').read_bytes(), b'Hello')
+
+    def test_explicit_programming_requests_still_select_programming(self):
+        for prompt in ['# Task: implement `tally.py`', 'Implement windows.py in this directory.',
+                       'Write a command-line tool tally.py.', 'Please create a Python script.',
+                       'Build a program that sorts numbers.']:
+            with self.subTest(prompt=prompt):
+                self.assertTrue(is_programming_request(prompt))
 
     def test_search_pagination_and_line_ranges(self):
         (self.root / 'events.log').write_text('hit one\nhit two\n' + 'hit more\n' * 19 + 'last\n')
@@ -540,6 +565,31 @@ class FinalToolTests(unittest.TestCase):
 
 
 class StreamTests(unittest.TestCase):
+    def test_recovers_from_repeated_gateway_framing_errors_without_echoing_prompts(self):
+        errors = [urllib.error.HTTPError('https://example.invalid', 400, 'Bad Request', {},
+                  io.BytesIO(b'<html>Bad request syntax (private unrelated prompt)</html>')) for _ in range(3)]
+        response = io.BytesIO(b'{"choices":[{"message":{"content":"recovered"},"finish_reason":"stop"}]}')
+        response.headers = {'Content-Type': 'application/json'}
+        output = io.StringIO()
+        with patch.dict(os.environ, {'QWEN_API_KEY': 'test-key', 'AGENT_DEBUG': '1'}), \
+                patch('model_client.urllib.request.urlopen', side_effect=[*errors, response]) as opened, \
+                patch('model_client.time.sleep'), patch('model_client.sys.stderr', output):
+            self.assertEqual(request_completion([], [], time.monotonic() + 60)['content'], 'recovered')
+        self.assertEqual(opened.call_count, 4)
+        self.assertNotIn('private unrelated prompt', output.getvalue())
+        self.assertTrue(all(error.fp.closed for error in errors))
+
+    def test_gateway_retry_respects_deadline(self):
+        error = urllib.error.HTTPError('https://example.invalid', 400, 'Bad Request', {},
+                                      io.BytesIO(b'<html>Bad request syntax</html>'))
+        with patch.dict(os.environ, {'QWEN_API_KEY': 'test-key'}), \
+                patch('model_client.urllib.request.urlopen', side_effect=error) as opened, \
+                patch('model_client.time.sleep') as sleep:
+            with self.assertRaisesRegex(AgentError, 'gateway rejected HTTP request framing'):
+                request_completion([], [], time.monotonic() + 1)
+        self.assertEqual(opened.call_count, 1)
+        sleep.assert_not_called()
+
     def test_retries_html_transport_rejection_but_not_regular_http_400(self):
         for transport in (True, False):
             with self.subTest(transport=transport):

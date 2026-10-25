@@ -112,7 +112,7 @@ Run offline checks from the submission folder:
 python3 -m unittest discover -s tests -v
 ```
 
-The complete suite has 75 offline tests and 21 optional live tests, including final-checkpoint checks. To run only the three live
+The complete suite includes offline tests and 21 optional live tests, including final-checkpoint checks. To run only the three live
 Checkpoint 2 conversations (10 separate agent invocations, sequentially):
 
 ```bash
@@ -247,7 +247,11 @@ as valid JSON in history so they cannot break the next API request.
 Programming requests use temperature 0.2 and top-p 0.8 to reduce variation between
 independent generations. Repeated syntax-breaking edits count toward the clean-rewrite
 threshold. Rejected HTML HTTP 400 responses reporting bad HTTP request syntax
-receive bounded retries; ordinary HTTP 400 validation errors do not.
+receive at most four retries within the same task deadline; ordinary HTTP 400
+validation errors do not. The client closes rejected responses and requests fresh,
+uncached connections. Debug output identifies framing failures without copying
+the gateway's echoed request contents. This is recovery for an endpoint problem,
+not a guarantee that an unavailable gateway can be repaired by the harness.
 Other requests retain temperature 0. Thinking remains disabled in every request.
 
 The live final tests include a 40,000-row spending CSV (quoted commas, refunds,
@@ -385,10 +389,10 @@ local and live tests from the submission folder:
 python3 scripts/run_tests.py --live
 ```
 
-Expect `Ran 74 tests` and `OK`, with no skipped tests. This command enables all
+Expect `OK`, with no skipped tests; the total includes all discovered tests. This command enables all
 four live-test flags and spaces separate agent invocations by 10 seconds to reduce
 rate limits on the shared endpoint. It can take several minutes. For offline-only
-checks use `python3 scripts/run_tests.py`; 19 live cases will be skipped.
+checks use `python3 scripts/run_tests.py`; 21 live cases will be skipped.
 Each live case invokes the Bash launcher from a fresh workspace, as the grader
 does. These are our own cases, not the hidden grading tests. Review the summaries
 printed by the tests as well as the automated result.

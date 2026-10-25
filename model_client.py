@@ -70,8 +70,9 @@ def request_completion(messages, tools, deadline, temperature=0, tool_choice='au
     url = os.environ.get('OPENAI_BASE_URL', 'https://llm.montii.me/v1').rstrip('/')
     request = urllib.request.Request(url + '/chat/completions', data=json.dumps(body).encode('utf-8'),
         headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json',
+                 'Connection': 'close', 'Cache-Control': 'no-cache, no-store',
                  'User-Agent': 'cs598-homework/0.3'}, method='POST')
-    for attempt in range(3):
+    for attempt in range(5):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise AgentError('Task exceeded its time limit.')
@@ -82,13 +83,20 @@ def request_completion(messages, tools, deadline, temperature=0, tool_choice='au
                 raise ValueError('Invalid message')
             return result
         except urllib.error.HTTPError as exc:
-            detail = exc.read(2048).decode('utf-8', errors='replace').replace(key, '[redacted]')
-            if os.environ.get('AGENT_DEBUG') == '1':
-                print(f'Endpoint HTTP {exc.code}: {detail}', file=sys.stderr)
+            try:
+                detail = exc.read(2048).decode('utf-8', errors='replace').replace(key, '[redacted]')
+            finally:
+                exc.close()
             # Retry rejected requests only. Never replay a successful completion.
             transport_rejection = (exc.code == 400 and 'Bad request syntax' in detail
                                    and '<html' in detail.lower())
-            if (exc.code in (429, 502, 503, 504) or transport_rejection) and attempt < 2:
+            if os.environ.get('AGENT_DEBUG') == '1':
+                # Gateway error pages can echo another request's entire prompt.
+                # Report the failure category without copying request contents.
+                diagnostic = 'gateway HTTP framing rejection' if transport_rejection else detail
+                print(f'Endpoint HTTP {exc.code}: {diagnostic}', file=sys.stderr)
+            retry_limit = 4 if transport_rejection else 2
+            if (exc.code in (429, 502, 503, 504) or transport_rejection) and attempt < retry_limit:
                 try:
                     delay = min(30, max(2 * (attempt + 1), float(exc.headers.get('Retry-After', 0))))
                 except (TypeError, ValueError):
@@ -96,6 +104,9 @@ def request_completion(messages, tools, deadline, temperature=0, tool_choice='au
                 if time.monotonic() + delay + 5 < deadline:
                     time.sleep(delay)
                     continue
+            if transport_rejection:
+                raise AgentError('Model gateway rejected HTTP request framing (HTTP 400); '
+                                 'bounded retries could not recover within the task deadline.') from None
             raise AgentError(f'Model endpoint returned HTTP {exc.code}.') from None
         except (urllib.error.URLError, TimeoutError, OSError):
             raise AgentError('Model endpoint could not be reached or timed out.') from None

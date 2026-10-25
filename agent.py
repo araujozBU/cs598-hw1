@@ -118,6 +118,11 @@ Adapt those names and declare EVERY flag from the user's specification. Dispatch
 Do not combine a command positional with subparsers: subparsers already consume the command name.
 For flag names that are Python keywords, specify a safe dest or use getattr(args, 'keyword'); attribute syntax with a keyword is invalid.
 Use csv.DictReader for CSV quoting, Decimal for exact money, and json.loads/json.dumps for JSON.
+When money requires two decimals, format EVERY money result with f"{value:.2f}", including zero
+and empty selections. Initialize sums with Decimal('0'); str(Decimal) does not enforce decimal places.
+Match the requested textual output exactly. For tabular rankings, emit one row per line with the
+specified delimiter and formatted values; never print Python lists, tuples, or Decimal reprs.
+Include an empty selection and a multi-row ranking in your independent output comparisons when applicable.
 For compact JSON use json.dumps(value, separators=(',', ':')). Never hand-build escaped JSON strings.
 When a specification requires JSON integers, validate type(value) is int; do not coerce strings, floats or booleans to integers.
 
@@ -333,6 +338,19 @@ def compact_json_error(output):
     return None
 
 
+def is_programming_request(prompt):
+    """Require an instruction to build code, not a programming word in a fact/path."""
+    return bool(re.search(
+        r'^\s*(?:#{1,6}\s*(?:Task:\s*)?)?'
+        r'(?:(?:please|can you|could you)\s+)?'
+        r'(?:implement|write|create|build|develop)\s+'
+        r'(?:(?:a|an|the)\s+)?'
+        r'(?:[`\"\']?[\w./-]+\.py\b|'
+        r'(?:Python(?:\s+3)?\s+)?(?:command[- ]line\s+)?(?:tool|program|script)\b|'
+        r'Python(?:\s+3)?\s+(?:code|application)\b)',
+        prompt, re.IGNORECASE | re.MULTILINE))
+
+
 def run_agent(prompt, workspace, request=model_request, history=None):
     deadline = time.monotonic() + TIME_LIMIT_SECONDS
     session_mode = history is not None
@@ -344,8 +362,7 @@ def run_agent(prompt, workspace, request=model_request, history=None):
         r'\s*(?:#\s*Task:\s*)?(?:(?:please|can you|could you)\s+)?'
         r'(?:read|write|create|implement|save|delete|remove|update|calculate|summari[sz]e)\b',
         prompt, re.IGNORECASE))
-    programming_task = bool(re.search(r'\bimplement\b|command.line (?:tool|program)|write (?:a |an )?(?:python|program|script)',
-                                      prompt, re.IGNORECASE))
+    programming_task = is_programming_request(prompt)
     debugging_task = not programming_task and bool(re.search(r'\b(?:incident|root.cause)\b', prompt, re.I)
                                                   and re.search(r'\blogs?\b', prompt, re.I)
                                                   and re.search(r'\.json\b', prompt, re.I))
