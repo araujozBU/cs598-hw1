@@ -12,10 +12,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--live', action='store_true', help='Enable every endpoint test.')
     parser.add_argument('--final-only', action='store_true',
-                        help='Run only the seven Part 3 live tasks (requires --live).')
+                        help='Run only the ten Part 3 live tasks (requires --live).')
     parser.add_argument('--pause', type=float, default=10, help='Seconds between live agent invocations (default 10).')
     parser.add_argument('--repeat-final', type=int, default=1,
-                        help='Run the seven final-checkpoint practice tasks this many times in fresh workspaces (with --live).')
+                        help='Run the ten final-checkpoint practice tasks this many times in fresh workspaces (with --live).')
     args = parser.parse_args()
     if args.pause < 0:
         parser.error('--pause must not be negative')

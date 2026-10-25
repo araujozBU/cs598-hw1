@@ -4,6 +4,7 @@ import hashlib
 import csv
 from decimal import Decimal
 import json
+import math
 import os
 import random
 from pathlib import Path
@@ -16,7 +17,10 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from agent import Workspace
-from final_fixtures import ALTERNATIVE_PROGRAM, MERGE_INTERVALS_PROGRAM, debugging_fixture, programming_fixture, chained_debugging_fixture
+from final_fixtures import (ALTERNATIVE_PROGRAM, MERGE_INTERVALS_PROGRAM,
+                            PRODUCT_EXCEPT_SELF_PROGRAM, LONGEST_UNIQUE_SUBSTRING_PROGRAM,
+                            debugging_fixture, programming_fixture, chained_debugging_fixture,
+                            import_pipeline_debugging_fixture)
 from final_coverage import assert_tally_coverage, LOCAL_EXTENSIONS
 
 
@@ -245,6 +249,54 @@ class FinalLiveTests(unittest.TestCase):
                         '[[true,3]]', '[[1.5,2]]', '[[1,"2"]]', '[[1,2,3]]', '[[1,2],null]'):
             with self.subTest(invalid=invalid):
                 self.run_generated_cli('merge_intervals.py', [], invalid, success=False)
+
+    def test_programming_product_except_self(self):
+        self.invoke(PRODUCT_EXCEPT_SELF_PROGRAM)
+        cases = [[], [9], [1, 2, 3, 4], [0, 2, 3], [0, 2, 0],
+                 [-1, 2, -3, 4], [1, 1, 1, 1], [0], [-7]]
+        rng = random.Random(598)
+        cases.extend([rng.choices(range(-3, 4), k=length) for length in (2, 5, 12, 30)])
+        for values in cases:
+            expected = [math.prod(value for index, value in enumerate(values) if index != skip)
+                        for skip in range(len(values))]
+            with self.subTest(values=values):
+                actual = self.run_generated_cli('product_except_self.py', [], json.dumps(values))
+                self.assertEqual(actual, json.dumps(expected, separators=(',', ':')) + '\n')
+        for invalid in ('', 'not json', '{}', 'null', '42', '[true,2]', '[1.5,2]',
+                        '["2",3]', '[1,null]', '[[1],2]'):
+            with self.subTest(invalid=invalid):
+                self.run_generated_cli('product_except_self.py', [], invalid, success=False)
+
+    def test_programming_longest_unique_substring(self):
+        self.invoke(LONGEST_UNIQUE_SUBSTRING_PROGRAM)
+        cases = ['', 'a', 'aaaa', 'abcabcbb', 'pwwkew', 'abba', 'dvdf',
+                 'AaA', 'éaé', '😀🐍😀x', 'e\u0301é']
+        rng = random.Random(598)
+        alphabet = ['a', 'b', 'c', 'é', '😀', '\u0301']
+        cases.extend(''.join(rng.choices(alphabet, k=length)) for length in (2, 7, 19, 35))
+        for value in cases:
+            expected = 0
+            for start in range(len(value)):
+                seen = set()
+                for character in value[start:]:
+                    if character in seen:
+                        break
+                    seen.add(character)
+                    expected = max(expected, len(seen))
+            with self.subTest(value=value):
+                self.assertEqual(self.run_generated_cli('longest_unique_substring.py', [],
+                                                       json.dumps(value, ensure_ascii=False)), f'{expected}\n')
+        for invalid in ('', 'not json', 'null', '42', 'true', '[]', '{}', '["abc"]'):
+            with self.subTest(invalid=invalid):
+                self.run_generated_cli('longest_unique_substring.py', [], invalid, success=False)
+
+    def test_debugging_import_pipeline_with_successful_storage_branch(self):
+        prompt, expected = import_pipeline_debugging_fixture(self.root)
+        self.invoke(prompt)
+        result = json.loads((self.root / 'REPORT.json').read_text())
+        self.assertEqual(result, expected)
+        for key, value in expected.items():
+            self.assertIs(type(result[key]), type(value), key)
 
     def test_debugging_follows_ids_and_exact_report_schema(self):
         prompt, expected = debugging_fixture(self.root)

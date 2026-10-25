@@ -14,7 +14,11 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from agent import AgentError, MAX_MODEL_CALLS, PROGRAMMING_PROMPT, Workspace, is_programming_request, model_request, probe_invalid_csv_rows, run_agent
+from agent import (AgentError, MAX_MODEL_CALLS, PROGRAMMING_PROMPT, Workspace,
+                   forbids_division, is_programming_request, model_request,
+                   normalize_json_string_stdin, probe_invalid_csv_rows,
+                   probe_zero_money_selection, requires_json_string_stdin, run_agent,
+                   same_json_value)
 from model_client import ContextLimitError, parse_completion, request_completion
 from completion_checks import CompletionChecks
 
@@ -203,6 +207,119 @@ class FinalToolTests(unittest.TestCase):
         self.assertTrue(any('also accepts booleans' in message['content'] for message in history
                             if message['role'] == 'tool'))
 
+    def test_explicit_no_division_rule_rejects_floor_division(self):
+        replies = iter([
+            self.call('write_file', path='answer.py', content='print(12 // 3)'),
+            self.call('replace_text', path='answer.py', old='12 // 3', new='2 * 2'),
+            self.call('run_python', path='answer.py'),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        history = []
+        result = run_agent('Implement answer.py. Do not use division.', self.workspace,
+                           request=lambda messages, deadline: next(replies), history=history)
+        self.assertEqual(result['message'], 'Verified.')
+        self.assertTrue(any('forbids division' in message['content'] for message in history
+                            if message['role'] == 'tool'))
+
+    def test_json_string_success_check_normalizes_singleton_test_input_without_source_edit(self):
+        source = ("import json, sys\nvalue = json.loads(sys.stdin.read())\n"
+                  "if not isinstance(value, str):\n    sys.exit(1)\nprint(len(value))\n")
+        replies = iter([
+            self.call('write_file', path='answer.py', content=source),
+            self.call('run_python', path='answer.py', stdin='["abc"]', reference_code='print(3)'),
+            self.call('run_python', path='answer.py', stdin='"abc"', reference_code='print(3)'),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        history = []
+        result = run_agent('Implement answer.py. Read one JSON string from stdin.', self.workspace,
+                           request=lambda messages, deadline: next(replies), history=history)
+        self.assertEqual(result['message'], 'Verified.')
+        self.assertEqual((self.root / 'answer.py').read_text(), source)
+        self.assertTrue(any(json.loads(message['content']).get('test_input_normalized') for message in history
+                            if message['role'] == 'tool'))
+        self.assertEqual(normalize_json_string_stdin('abc'), '"abc"')
+        self.assertEqual(normalize_json_string_stdin('json.dumps("abc")'), '"abc"')
+        self.assertIsNone(normalize_json_string_stdin('[1,2]'))
+
+    def test_negative_test_enforces_stderr_even_if_reference_matches_stdout(self):
+        broken = 'import sys\nprint("Invalid input")\nsys.exit(1)\n'
+        fixed = 'import sys\nprint("Invalid input", file=sys.stderr)\nsys.exit(1)\n'
+        replies = iter([
+            self.call('write_file', path='answer.py', content=broken),
+            self.call('run_python', path='answer.py', expected_exit_code=1,
+                      reference_code='import sys; print("Invalid input"); sys.exit(1)'),
+            self.call('write_file', path='answer.py', content=fixed),
+            self.call('run_python', path='answer.py', expected_exit_code=1),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        history = []
+        result = run_agent('Implement answer.py. On invalid input exit nonzero, print a useful error '
+                           'to stderr, and print nothing to stdout.', self.workspace,
+                           request=lambda messages, deadline: next(replies), history=history)
+        self.assertEqual(result['message'], 'Verified.')
+        outcomes = [json.loads(message['content']) for message in history if message['role'] == 'tool'
+                    and 'exit_code' in json.loads(message['content'])]
+        self.assertTrue(outcomes[0]['reference_ignored_for_negative_test'])
+        self.assertEqual(outcomes[0]['status'], 'error')
+        self.assertIn('stderr is empty', outcomes[0]['format_error'])
+        self.assertEqual(outcomes[1]['status'], 'success')
+
+    def test_invalid_json_probe_catches_wrong_error_channel_without_model_test(self):
+        broken = ("import json, sys\ntry:\n    value = json.loads(sys.stdin.read())\n"
+                  "except ValueError:\n    print('Invalid JSON')\n    sys.exit(1)\nprint(value)\n")
+        fixed = broken.replace("print('Invalid JSON')", "print('Invalid JSON', file=sys.stderr)")
+        replies = iter([
+            self.call('write_file', path='answer.py', content=broken),
+            self.call('run_python', path='answer.py', stdin='1', reference_code='print(1)'),
+            self.call('write_file', path='answer.py', content=fixed),
+            self.call('run_python', path='answer.py', stdin='1', reference_code='print(1)'),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        history = []
+        result = run_agent('Implement answer.py. Read JSON from stdin. On invalid JSON, exit nonzero, '
+                           'print a useful error to stderr and print nothing to stdout.', self.workspace,
+                           request=lambda messages, deadline: next(replies), history=history)
+        self.assertEqual(result['message'], 'Verified.')
+        probes = [json.loads(message['content']) for message in history if message['role'] == 'tool'
+                  and 'json_rejection_probe' in json.loads(message['content'])]
+        self.assertEqual([probe['status'] for probe in probes], ['error', 'success'])
+        self.assertEqual((self.root / 'answer.py').read_text(), fixed)
+
+    def test_bad_json_string_test_is_routed_only_to_run_python(self):
+        messages = [{'role': 'system', 'content': PROGRAMMING_PROMPT},
+                    {'role': 'user', 'content': 'Implement answer.py. Read one JSON string from stdin.'},
+                    self.call('run_python', path='answer.py', stdin='["abc"]'),
+                    {'role': 'tool', 'tool_call_id': 'run_python', 'content': json.dumps({
+                        'status': 'error', 'test_input_error': True,
+                        'message': 'stdin is a JSON array, not a string',
+                        'failed_test': {'path': 'answer.py', 'stdin': '["abc"]'}})}]
+        with patch('agent.request_completion', return_value={}) as requested:
+            model_request(messages, time.monotonic() + 5)
+        repair_messages, repair_tools = requested.call_args.args[:2]
+        self.assertEqual({tool['function']['name'] for tool in repair_tools}, {'run_python'})
+        self.assertEqual(requested.call_args.kwargs['tool_choice']['function']['name'], 'run_python')
+        self.assertIn('Do not edit source', repair_messages[0]['content'])
+
+    def test_repeated_unusable_json_string_tests_stop_before_timeout(self):
+        replies = iter([
+            self.call('write_file', path='answer.py', content='print(1)'),
+            *[self.call('run_python', path='answer.py', stdin='[1,2]') for _ in range(3)],
+        ])
+        with self.assertRaisesRegex(AgentError, 'Three consecutive expected-success tests'):
+            run_agent('Implement answer.py. Read one JSON string from stdin.', self.workspace,
+                      request=lambda messages, deadline: next(replies), history=[])
+
+    def test_input_constraints_recognize_other_task_wordings(self):
+        for prompt in ('Read one JSON string from stdin.',
+                       'Standard input contains a JSON-encoded string.',
+                       'Parse the JSON string from stdin.'):
+            self.assertTrue(requires_json_string_stdin(prompt), prompt)
+        self.assertFalse(requires_json_string_stdin('Read one JSON string from config.json.'))
+        for prompt in ('Do not use division.', 'Solve without using division.',
+                       'Division is prohibited.', 'No division is allowed.'):
+            self.assertTrue(forbids_division(prompt), prompt)
+        self.assertFalse(forbids_division('Use division when appropriate.'))
+
     def test_repeated_identical_mismatch_returns_to_repair_instead_of_review(self):
         check = {'outputs_match': False, 'exit_code': 0, 'stdout': '4',
                  'reference': {'exit_code': 0, 'stdout': '3'}, 'repeat_failure': True}
@@ -245,6 +362,46 @@ class FinalToolTests(unittest.TestCase):
         self.assertIn('print(missing_import)', json.dumps(repair_messages))
         self.assertEqual({tool['function']['name'] for tool in repair_tools},
                          {'run_python', 'read_lines', 'read_file', 'analyze_python'})
+
+    def test_repeated_reference_syntax_error_switches_to_validated_multiline_calculation(self):
+        failed = {'path': 'answer.py', 'stdin': '"abc"',
+                  'reference_code': 'print(len((x for x in "abc"))))'}
+        failure = {'status': 'error', 'outputs_match': False, 'exit_code': 0,
+                   'stdout': '3\n', 'reference_failure_repeats': 2, 'failed_test': failed,
+                   'reference': {'exit_code': 1, 'stderr': 'SyntaxError: unmatched )'}}
+        messages = [{'role': 'system', 'content': PROGRAMMING_PROMPT},
+                    {'role': 'user', 'content': 'Implement answer.py. Read one JSON string from stdin.'},
+                    self.call('run_python', **failed),
+                    {'role': 'tool', 'tool_call_id': 'run_python', 'content': json.dumps(failure)}]
+        with patch('agent.request_completion', return_value={}) as requested:
+            model_request(messages, time.monotonic() + 5)
+        self.assertEqual(requested.call_args.kwargs['tool_choice']['function']['name'], 'analyze_python')
+        self.assertIn('multiline', requested.call_args.args[0][0]['content'])
+        validated = 's = "abc"\nprint(len(s))'
+        messages.extend([self.call('analyze_python', code=validated, stdin='"abc"'),
+                         {'role': 'tool', 'tool_call_id': 'analyze_python',
+                          'content': json.dumps({'status': 'success', 'exit_code': 0, 'stdout': '3\n'})}])
+        with patch('agent.request_completion', return_value={}) as requested:
+            model_request(messages, time.monotonic() + 5)
+        self.assertEqual(requested.call_args.kwargs['tool_choice']['function']['name'], 'run_python')
+        context = json.loads(requested.call_args.args[0][-1]['content'])
+        self.assertEqual(context['validated_reference_code'], validated)
+        self.assertEqual(context['failed_test']['stdin'], '"abc"')
+
+    def test_repeated_reference_json_decode_error_uses_same_recovery(self):
+        failed = {'path': 'answer.py', 'stdin': '"abc"',
+                  'reference_code': 'import json\nprint(len(json.loads(bad_text)))'}
+        failure = {'status': 'error', 'outputs_match': False, 'exit_code': 0,
+                   'stdout': '3\n', 'reference_failure_repeats': 2, 'failed_test': failed,
+                   'reference': {'exit_code': 1, 'stderr': 'json.decoder.JSONDecodeError: Unterminated string'}}
+        messages = [{'role': 'system', 'content': PROGRAMMING_PROMPT},
+                    {'role': 'user', 'content': 'Implement answer.py. Read one JSON string from stdin.'},
+                    self.call('run_python', **failed),
+                    {'role': 'tool', 'tool_call_id': 'run_python', 'content': json.dumps(failure)}]
+        with patch('agent.request_completion', return_value={}) as requested:
+            model_request(messages, time.monotonic() + 5)
+        self.assertEqual(requested.call_args.kwargs['tool_choice']['function']['name'], 'analyze_python')
+        self.assertIn('decode it once', requested.call_args.args[0][0]['content'])
 
     def test_runtime_failure_supplies_current_source_to_repair_step(self):
         history = self.scripted('Implement answer.py that prints 4.', [
@@ -885,6 +1042,50 @@ class FinalToolTests(unittest.TestCase):
         self.workspace.execute('replace_text', edit)
         self.assertEqual(probe_invalid_csv_rows(self.workspace, 'count.py', 'input.csv')['status'], 'success')
 
+    def test_csv_precision_probe_rejects_three_decimal_places(self):
+        (self.root / 'input.csv').write_text('date,description,category,amount\n2026-01-01,Item,Food,1.00\n')
+        source = ("import csv, sys\nwith open(sys.argv[-1], newline='') as handle:\n"
+                  "    rows = list(csv.reader(handle))[1:]\n"
+                  "print(sum(len(row) == 4 for row in rows))\n")
+        (self.root / 'count.py').write_text(source)
+        result = probe_invalid_csv_rows(self.workspace, 'count.py', 'input.csv', True)
+        self.assertEqual(result['probe_case'], 'excess-decimal-places')
+        self.assertIn('1.001', result['message'])
+        repaired = source.replace('len(row) == 4 for row in rows',
+                                  "len(row) == 4 and len(row[3].split('.')[-1]) <= 2 for row in rows")
+        (self.root / 'count.py').write_text(repaired)
+        self.assertEqual(probe_invalid_csv_rows(self.workspace, 'count.py', 'input.csv', True)['status'], 'success')
+
+    def test_csv_precision_probe_suggests_edit_to_amount_validator(self):
+        (self.root / 'input.csv').write_text('date,description,category,amount\n2026-01-01,Item,Food,1.00\n')
+        source = ("import csv, decimal, sys\n"
+                  "def valid(row):\n"
+                  "    if len(row) != 4:\n        return False\n"
+                  "    try:\n        amount = decimal.Decimal(row[3])\n"
+                  "    except decimal.DecimalException:\n        return False\n"
+                  "    if amount is None or not amount.is_finite():\n        return False\n"
+                  "    return True\n"
+                  "with open(sys.argv[-1], newline='') as handle:\n"
+                  "    rows = list(csv.reader(handle))[1:]\n"
+                  "print(sum(valid(row) for row in rows))\n")
+        (self.root / 'count.py').write_text(source)
+        result = probe_invalid_csv_rows(self.workspace, 'count.py', 'input.csv', True)
+        self.assertEqual(result['probe_case'], 'excess-decimal-places')
+        edit = result['suggested_tool_call']['arguments']
+        self.assertIn('amount.as_tuple().exponent < -2', edit['new'])
+        self.assertEqual(self.workspace.execute('replace_text', edit)['replacements'], 1)
+        self.assertEqual(probe_invalid_csv_rows(self.workspace, 'count.py', 'input.csv', True)['status'], 'success')
+
+    def test_money_zero_probe_uses_absent_category(self):
+        (self.root / 'input.csv').write_text('category,amount\nfood,1.00\n')
+        broken = ("import sys\ncategory = sys.argv[sys.argv.index('--category') + 1]\n"
+                  "print('1.00' if category == 'food' else '0')\n")
+        (self.root / 'total.py').write_text(broken)
+        result = probe_zero_money_selection(self.workspace, 'total.py', 'input.csv', 'total')
+        self.assertEqual(result['probe_case'], 'zero money selection')
+        (self.root / 'total.py').write_text(broken.replace("else '0'", "else '0.00'"))
+        self.assertEqual(probe_zero_money_selection(self.workspace, 'total.py', 'input.csv', 'total')['status'], 'success')
+
     def test_cli_rejection_probe_requires_clean_errors_before_success(self):
         (self.root / 'input.csv').write_text('name\nItem\n')
         broken = ("import sys\npath = sys.argv[sys.argv.index('--file') + 1]\n"
@@ -960,6 +1161,24 @@ class FinalToolTests(unittest.TestCase):
         self.assertEqual(result['status'], 'success')
         outputs = [json.loads(m['content']) for m in history if m['role'] == 'tool' and 'format_error' in json.loads(m['content'])]
         self.assertEqual([o['status'] for o in outputs], ['error', 'success'])
+
+    def test_compact_candidate_accepts_semantically_equal_spaced_json_reference(self):
+        replies = iter([
+            self.call('write_file', path='answer.py', content="print('[3,5]')"),
+            self.call('run_python', path='answer.py', reference_code='print([3, 5])'),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        history = []
+        result = run_agent('Implement answer.py. Print a compact JSON array.', self.workspace,
+                           request=lambda messages, deadline: next(replies), history=history)
+        self.assertEqual(result['message'], 'Verified.')
+        comparisons = [json.loads(message['content']) for message in history if message['role'] == 'tool'
+                       and 'reference_json_format_ignored' in json.loads(message['content'])]
+        self.assertEqual(len(comparisons), 1)
+        self.assertTrue(comparisons[0]['outputs_match'])
+        self.assertTrue(same_json_value('{"a":1,"b":2}', '{"b": 2, "a": 1}'))
+        self.assertFalse(same_json_value('[true]', '[1]'))
+        self.assertFalse(same_json_value('[3,5]', '[3,6]'))
 
     def test_repeated_program_failures_require_clean_rewrite(self):
         def call(name, arguments):

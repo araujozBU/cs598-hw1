@@ -113,7 +113,7 @@ Run offline checks from the submission folder:
 python3 -m unittest discover -s tests -v
 ```
 
-The complete suite includes offline tests and 22 optional live tests, including final-checkpoint checks. To run only the three live
+The complete suite includes offline tests and 25 optional live tests, including final-checkpoint checks. To run only the three live
 Checkpoint 2 conversations (10 separate agent invocations, sequentially):
 
 ```bash
@@ -275,7 +275,7 @@ To repeat final-checkpoint tasks in fresh workspaces while rerunning all earlier
 capabilities, use `python3 scripts/run_tests.py --live --repeat-final 3`.
 For a focused Part 3 reliability run, use
 `KEEP_FINAL_TESTS=1 AGENT_DEBUG=1 python3 scripts/run_tests.py --live --final-only --repeat-final 3`.
-This runs the seven Part 3 practice tasks three times in fresh workspaces and
+This runs the ten Part 3 practice tasks three times in fresh workspaces and
 retains each generated workspace for inspecting any failure.
 Set `KEEP_FINAL_TESTS=1` to retain final-task workspaces for diagnosing failures;
 keep those retained workspaces outside the submission archive.
@@ -318,7 +318,8 @@ Other requests retain temperature 0. Thinking remains disabled in every request.
 
 The live final tests include a 40,000-row spending CSV (quoted commas, refunds,
 mixed category case, ties, date boundaries, alternate input paths), a different
-sliding-window and merge-intervals programming problems, and two noisy four-service log incidents
+sliding-window, merge-intervals, product-except-self, and longest-unique-substring
+programming problems, and three noisy four-service log incidents
 with different identifiers and causal classes. Tests check exact outputs, JSON
 keys/types, and preservation of all supplied inputs and unrelated files. The six
 unpublished programming requirements and six unpublished report fields are not
@@ -455,7 +456,7 @@ python3 scripts/run_tests.py --live
 Expect `OK`, with no skipped tests; the total includes all discovered tests. This command enables all
 four live-test flags and spaces separate agent invocations by 10 seconds to reduce
 rate limits on the shared endpoint. It can take several minutes. For offline-only
-checks use `python3 scripts/run_tests.py`; 21 live cases will be skipped.
+checks use `python3 scripts/run_tests.py`; 25 live cases will be skipped.
 Each live case invokes the Bash launcher from a fresh workspace, as the grader
 does. These are our own cases, not the hidden grading tests. Review the summaries
 printed by the tests as well as the automated result.
@@ -894,7 +895,7 @@ repeat the checks against an extracted clean archive to verify its contents too.
 
 ### Expanded Checkpoint 3 test coverage
 
-See `tests/fixtures/coverage.md` for the requirement-to-test map, the seven live
+See `tests/fixtures/coverage.md` for the requirement-to-test map, the ten live
 tasks, and the distinction between published requirements and explicitly defined
 local practice extensions. New tally checks use an independent integer-cent
 oracle and direct CLI execution with site-packages disabled.

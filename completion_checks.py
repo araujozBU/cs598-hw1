@@ -35,7 +35,8 @@ def scalar_money_commands(prompt):
 
 class CompletionChecks:
     def __init__(self, workspace, outputs, programming, report_prompt='', validate_json=False, integer_array=False,
-                 money_commands=(), programming_prompt='', strict_json_integers=False):
+                 money_commands=(), programming_prompt='', strict_json_integers=False,
+                 forbid_division=False):
         self.workspace = workspace
         self.outputs = outputs
         self.programming = programming
@@ -50,6 +51,7 @@ class CompletionChecks:
         self.validate_json = validate_json or bool(report_prompt)
         self.integer_array = integer_array
         self.strict_json_integers = strict_json_integers or integer_array
+        self.forbid_division = forbid_division
         self.integer_input_checks = {'boolean', 'float', 'string'} if integer_array else set()
         self.valid_integer_args = {}
         self.money_commands = set(money_commands)
@@ -194,6 +196,13 @@ class CompletionChecks:
                              'for the option names cannot work.')
                     self.source_errors[path] = error
                     return {'validation_error': error, 'unused_options': unused}
+        if self.forbid_division:
+            division = next((node for node in ast.walk(tree) if isinstance(node, ast.BinOp)
+                             and isinstance(node.op, (ast.Div, ast.FloorDiv))), None)
+            if division:
+                expression = ast.get_source_segment(source, division)
+                return {'validation_error': 'The specification forbids division, but the source uses '
+                        + repr(expression) + '. Use a division-free algorithm and handle zero inputs.'}
         if not self.strict_json_integers:
             return None
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
@@ -305,7 +314,8 @@ class CompletionChecks:
                     'test an actual empty/no-match selection for these commands and verify stdout is 0.00 followed by a newline: '
                     + ', '.join(sorted(self.money_zero_pending))
                     + '. Decimal zero printed without explicit formatting becomes 0, which violates the output contract. '
-                    'Use a real empty selection; do not hard-code a zero result or guess data totals.')
+                    'An unfiltered total over a nonempty file is not a zero-result check. '
+                    'Use a category absent from the input or a header-only CSV; do not hard-code a zero result.')
         if self.integer_input_checks:
             return ('The specification requires a strict JSON integer array. Use run_python with a valid CLI argument '
                     'and first verify a valid integer array succeeds. With those SAME arguments, test SEPARATE arrays '

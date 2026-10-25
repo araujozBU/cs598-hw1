@@ -1,5 +1,6 @@
 """A small Qwen tool-calling harness. All file paths belong to the caller's cwd."""
 
+import ast
 import csv
 import json
 import keyword
@@ -22,6 +23,10 @@ MAX_MODEL_CALLS = 120
 PROGRAMMING_TEMPERATURE = 0.2
 
 
+class TestInputError(ValueError):
+    """A generated verification call contradicts the task's input contract."""
+
+
 def debug_tool_result(name, arguments, result, started):
     if os.environ.get('AGENT_DEBUG') != '1':
         return
@@ -29,7 +34,8 @@ def debug_tool_result(name, arguments, result, started):
                'path': arguments.get('path'), 'args': arguments.get('args', []),
                'elapsed_ms': round((time.monotonic() - started) * 1000)}
     for key in ('exit_code', 'outputs_match', 'timed_out', 'rewrite_required',
-                'reference_import_added', 'reference_failure_repeats', 'probe_case'):
+                'reference_import_added', 'reference_failure_repeats', 'probe_case',
+                'reference_json_format_ignored'):
         if key in result:
             summary[key] = result[key]
     for key in ('stdout', 'stderr', 'syntax_error', 'validation_error', 'format_error',
@@ -44,7 +50,7 @@ def debug_tool_result(name, arguments, result, started):
     print(json.dumps(summary, ensure_ascii=False), file=sys.stderr)
 
 
-def probe_invalid_csv_rows(workspace, source_path, input_csv):
+def probe_invalid_csv_rows(workspace, source_path, input_csv, check_amount_precision=False):
     """Check that malformed CSV records do not change a valid count result."""
     try:
         with workspace.file_path(input_csv).open(newline='', encoding='utf-8') as handle:
@@ -56,10 +62,15 @@ def probe_invalid_csv_rows(workspace, source_path, input_csv):
         return None
     with tempfile.TemporaryDirectory(prefix='.agent_csv_probe_', dir=workspace.root) as directory:
         directory = Path(directory)
-        cases = ((directory / 'baseline.csv', []),
-                 (directory / 'missing.csv', [sample[:-1]]),
-                 (directory / 'extra.csv', [[*sample, 'extra']]))
-        for path, extra_rows in cases:
+        cases = [('baseline', directory / 'baseline.csv', []),
+                 ('missing-field', directory / 'missing.csv', [sample[:-1]]),
+                 ('extra-field', directory / 'extra.csv', [[*sample, 'extra']])]
+        if check_amount_precision and 'amount' in [name.lower() for name in header]:
+            amount_index = [name.lower() for name in header].index('amount')
+            precise_row = list(sample)
+            precise_row[amount_index] = '1.001'
+            cases.append(('excess-decimal-places', directory / 'precision.csv', [precise_row]))
+        for _, path, extra_rows in cases:
             with path.open('w', newline='', encoding='utf-8') as handle:
                 writer = csv.writer(handle)
                 writer.writerow(header)
@@ -68,8 +79,8 @@ def probe_invalid_csv_rows(workspace, source_path, input_csv):
         def run(path):
             return workspace.execute('run_python', {'path': source_path,
                 'args': ['count', '--file', str(path.relative_to(workspace.root))]})
-        baseline = run(cases[0][0])
-        for case_name, (path, _) in zip(('missing-field', 'extra-field'), cases[1:]):
+        baseline = run(cases[0][1])
+        for case_name, path, _ in cases[1:]:
             probed = run(path)
             if (baseline['exit_code'] == probed['exit_code'] == 0
                     and not baseline['timed_out'] and not probed['timed_out']
@@ -77,14 +88,30 @@ def probe_invalid_csv_rows(workspace, source_path, input_csv):
                     and baseline['stdout'] == probed['stdout']):
                 continue
             source = workspace.file_path(source_path).read_text(encoding='utf-8')
+            message = ('The task says to skip invalid rows. Adding one ' + case_name +
+                       ' CSV record changed the count result or crashed the program. ')
+            if case_name == 'excess-decimal-places':
+                message += ('The amount 1.001 has more than two decimal places. '
+                            'Validate the raw amount before counting it or rounding it.')
+            else:
+                message += ('csv.DictReader represents missing cells as None values and extra cells '
+                            'under the None key. Reject both before parsing any field.')
             result = {'status': 'error', 'repair_required': True, 'probe_case': case_name,
-                'message': ('The task says to skip invalid rows. Adding one ' + case_name +
-                            ' CSV record changed the count result or crashed the program. '
-                            'csv.DictReader represents missing cells as None values and extra cells under '
-                            'the None key. Reject both before parsing any field.'),
+                'message': message,
                 'baseline': baseline, 'probed': probed,
                 'current_source': workspace.execute('read_lines', {'path': source_path, 'max_lines': 500})}
-            reader = re.search(r'(?m)^\s*([A-Za-z_]\w*)\s*=\s*csv\.DictReader\(', source)
+            if case_name == 'excess-decimal-places' and '.as_tuple().exponent' not in source:
+                finite_check = re.search(
+                    r'(?m)^([ \t]*)if ([A-Za-z_]\w*) is None or not \2\.is_finite\(\):[ \t]*\n'
+                    r'\1[ \t]+return False[ \t]*$', source)
+                if finite_check and source.count(finite_check.group(0)) == 1:
+                    indent, amount = finite_check.group(1), finite_check.group(2)
+                    result['suggested_tool_call'] = {'name': 'replace_text', 'arguments': {
+                        'path': source_path, 'old': finite_check.group(0),
+                        'new': (finite_check.group(0) + '\n' + indent +
+                                'if ' + amount + '.as_tuple().exponent < -2:\n' +
+                                indent + '    return False')}}
+            reader = re.search(r'(?m)^\s*([A-Za-z_]\w*)\s*=\s*csv\.DictReader\(', source) if case_name != 'excess-decimal-places' else None
             if reader:
                 loop = re.search(r'(?m)^([ \t]*)for ([A-Za-z_]\w*) in ' +
                                  re.escape(reader.group(1)) + r':[ \t]*$', source)
@@ -120,6 +147,38 @@ def probe_cli_rejections(workspace, source_path, input_csv, missing_file, unsupp
                 'probed': result,
                 'current_source': workspace.execute('read_lines', {'path': source_path, 'max_lines': 500})}
     return {'status': 'success', 'message': 'Required CLI error paths produced useful stderr without tracebacks.'}
+
+
+def probe_invalid_json_rejection(workspace, source_path, require_empty_stdout):
+    """Exercise an explicitly required stdin JSON error path."""
+    result = workspace.execute('run_python', {'path': source_path, 'stdin': 'not json'})
+    if (result['exit_code'] != 0 and result['stderr'].strip()
+            and 'Traceback' not in result['stderr']
+            and (not require_empty_stdout or not result['stdout'])
+            and not result['timed_out'] and not result['output_truncated']):
+        return {'status': 'success', 'message': 'Invalid JSON produced a useful stderr error.'}
+    return {'status': 'error', 'repair_required': True, 'probe_case': 'invalid JSON',
+            'message': 'The task requires invalid JSON to exit nonzero with a useful error on stderr'
+                       + (' and no stdout' if require_empty_stdout else '')
+                       + '. Catch the parse error, print to sys.stderr, and avoid a traceback.',
+            'probed': result,
+            'current_source': workspace.execute('read_lines', {'path': source_path, 'max_lines': 500})}
+
+
+def probe_zero_money_selection(workspace, source_path, input_csv, command):
+    """Check the empty category selection required by a scalar money CLI."""
+    absent = '__agent_absent_category_' + str(time.monotonic_ns()) + '__'
+    args = [command, '--category', absent, '--file', input_csv]
+    result = workspace.execute('run_python', {'path': source_path, 'args': args})
+    if (result['exit_code'] == 0 and result['stdout'] == '0.00\n' and not result['stderr']
+            and not result['timed_out'] and not result['output_truncated']):
+        return {'status': 'success', 'message': 'A no-match category printed exactly 0.00.'}
+    return {'status': 'error', 'repair_required': True, 'probe_case': 'zero money selection',
+            'message': 'A category absent from the supplied CSV must produce exactly 0.00 followed by '
+                       'a newline for this money command. Test and format the calculated zero value; '
+                       'do not hard-code the answer.',
+            'probed': result,
+            'current_source': workspace.execute('read_lines', {'path': source_path, 'max_lines': 500})}
 
 
 SYSTEM_PROMPT = """You are an agent for file management, conversation, programming and debugging inside a task workspace.
@@ -255,9 +314,14 @@ Examples in the task illustrate formatting, NOT answers for the actual data. Use
 For other expected results, use analyze_python to independently calculate them from actual inputs BEFORE testing.
 Print the independent result in the required output format. Never guess a total, category list, or date-range result.
 For small stdin examples, derive their expected results independently too. Check empty and boundary inputs.
+When stdin must be a JSON string, pass a quoted JSON string (for example json.dumps('abc'))
+as stdin. Raw abc is not valid JSON and a JSON array is not a JSON string.
 Use run_python with the saved path, args and stdin. For exact checks supply reference_code: a short Python calculation
 that independently computes the answer from actual inputs and prints it in the required format. Do not import the candidate
 program in this reference or guess its expected output. The tool runs both and reports outputs_match.
+Choose a small, diverse set of tests for each unchanged program version: normal behavior, important boundaries,
+and invalid input. Do not repeatedly test incremental prefixes or equivalent variations after they pass.
+For compact JSON, format the independent reference with separators=(',', ':') too.
 Set expected_exit_code for deliberately invalid inputs and omit reference_code for these rejection tests.
 Child execution is read-only: no writes, network or subprocesses.
 If a deliberately invalid test was mistakenly run with expected_exit_code=0, rerun the same input with the correct expected_exit_code.
@@ -402,6 +466,44 @@ def model_request(messages, deadline):
     latest_user = max((index for index, message in enumerate(messages) if message.get('role') == 'user'), default=0)
     if programming and messages[-1].get('role') == 'tool':
         check = json.loads(messages[-1]['content'])
+        if check.get('test_input_error'):
+            repair = [{'role': 'system', 'content': (
+                'The previous run_python call supplied invalid test input for a case expected to succeed. '
+                'The saved program has not failed this check. Call run_python again with the same path '
+                'and a JSON-encoded string in stdin. For the three-character string abc, '
+                'the stdin argument must contain the five characters "abc" including both quote characters. '
+                'Do not send the literal expression json.dumps("abc") as stdin. '
+                'Keep an independent reference_code if checking exact output. Do not edit source.')},
+                {'role': 'user', 'content': json.dumps({
+                    'task': messages[latest_user]['content'],
+                    'failed_test': check.get('failed_test'), 'error': check.get('message')}, ensure_ascii=False)}]
+            return request_completion(repair, [tool for tool in TOOLS
+                                               if tool['function']['name'] == 'run_python'],
+                                      deadline, temperature=0,
+                                      tool_choice={'type': 'function', 'function': {'name': 'run_python'}})
+        if check.get('exit_code') == 0:
+            last_call = next((call for message in reversed(messages[:-1])
+                              for call in message.get('tool_calls', [])
+                              if call.get('id') == messages[-1].get('tool_call_id')), {})
+            if last_call.get('function', {}).get('name') == 'analyze_python':
+                previous = messages[-3] if len(messages) >= 3 else {}
+                prior = (json.loads(previous['content']) if previous.get('role') == 'tool'
+                         and 'reference_failure_repeats' in previous.get('content', '') else {})
+                if prior.get('reference_failure_repeats', 0) >= 2 and prior.get('failed_test'):
+                    validated = json.loads(last_call['function']['arguments'])
+                    followup = [{'role': 'system', 'content': (
+                        'The new independent calculation ran successfully. Rerun the saved candidate with '
+                        'the SAME path, args and stdin from failed_test, using the validated code as reference_code. '
+                        'Preserve the candidate program and do not reuse the earlier broken reference.')},
+                        {'role': 'user', 'content': json.dumps({
+                            'task': messages[latest_user]['content'],
+                            'failed_test': prior['failed_test'],
+                            'validated_reference_code': validated.get('code'),
+                            'validated_stdout': check.get('stdout')}, ensure_ascii=False)}]
+                    return request_completion(followup, [tool for tool in TOOLS
+                                                         if tool['function']['name'] == 'run_python'],
+                                              deadline, temperature=0,
+                                              tool_choice={'type': 'function', 'function': {'name': 'run_python'}})
         missing_source = check.get('create_required') or next(iter(check.get('missing_source_files', [])), None)
         if missing_source:
             creation = [{'role': 'system', 'content': PROGRAMMING_PROMPT + '\n' +
@@ -421,6 +523,24 @@ def model_request(messages, deadline):
                                for call in message.get('tool_calls', [])
                                if call.get('id') == messages[-1].get('tool_call_id')), {})
             arguments = check.get('failed_test') or json.loads(failed_call.get('function', {}).get('arguments', '{}'))
+            if check.get('reference_failure_repeats', 0) >= 2:
+                preparation = [{'role': 'system', 'content': (
+                    'The independent reference has failed with the same error twice. '
+                    'Preserve the saved candidate program. Build a NEW short, multiline reference calculation '
+                    'from the specification using simple loops and explicit imports. '
+                    'Use analyze_python with the same stdin to compile and run it before using it in run_python. '
+                    'When the failure is JSONDecodeError, read sys.stdin.read() and decode it once; '
+                    'do not embed or reparse the stdin text as a Python string literal. '
+                    'Do not copy the previous failing expression or import the candidate.')},
+                    {'role': 'user', 'content': json.dumps({
+                        'task': messages[latest_user]['content'],
+                        'test_arguments': arguments,
+                        'candidate_stdout': check.get('stdout'),
+                        'reference_error': reference.get('stderr', '')[-1200:]}, ensure_ascii=False)}]
+                return request_completion(preparation, [tool for tool in TOOLS
+                                                        if tool['function']['name'] == 'analyze_python'],
+                                          deadline, temperature=0,
+                                          tool_choice={'type': 'function', 'function': {'name': 'analyze_python'}})
             repair = [{'role': 'system', 'content': (
                 'Repair the independent test calculation. Preserve the saved candidate program. '
                 'Only the reference failed or was identified as wrong. Inspect actual inputs if needed, '
@@ -563,6 +683,54 @@ def compact_json_error(output):
     return None
 
 
+def same_json_value(left, right):
+    """Compare JSON values while preserving distinctions such as true versus 1."""
+    try:
+        canonical = lambda value: json.dumps(json.loads(value), sort_keys=True, separators=(',', ':'))
+        return canonical(left) == canonical(right)
+    except (ValueError, TypeError):
+        return False
+
+
+def requires_json_string_stdin(prompt):
+    return bool(re.search(r'\b(?:stdin|standard input)\b', prompt, re.I)
+                and re.search(r'\b(?:read|accept|parse)\s+(?:one|a|the)\s+JSON(?:-encoded)?\s+string\b|'
+                              r'\b(?:stdin|standard input)\s+(?:contains|is|provides)\s+'
+                              r'(?:one|a|the)\s+JSON(?:-encoded)?\s+string\b', prompt, re.I))
+
+
+def normalize_json_string_stdin(raw):
+    """Repair an unambiguous positive test input without executing model text."""
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        try:
+            expression = ast.parse(raw, mode='eval').body
+            if (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Attribute)
+                    and isinstance(expression.func.value, ast.Name)
+                    and expression.func.value.id == 'json' and expression.func.attr == 'dumps'
+                    and len(expression.args) == 1 and not expression.keywords):
+                value = ast.literal_eval(expression.args[0])
+            else:
+                value = ast.literal_eval(expression)
+            if isinstance(value, str):
+                return json.dumps(value)
+        except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+            pass
+        return json.dumps(raw)
+    if isinstance(value, str):
+        return raw
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], str):
+        return json.dumps(value[0])
+    return None
+
+
+def forbids_division(prompt):
+    return bool(re.search(r'\b(?:do not|don\'t|must not|may not)\s+(?:use|perform)\s+division\b|'
+                          r'\b(?:without|no)\s+(?:using\s+)?division\b|'
+                          r'\bdivision\s+is\s+(?:forbidden|prohibited|not allowed)\b', prompt, re.I))
+
+
 def is_programming_request(prompt):
     """Require an instruction to build code, not a programming word in a fact/path."""
     return bool(re.search(
@@ -592,10 +760,11 @@ def run_agent(prompt, workspace, request=model_request, history=None):
     debugging_task = not programming_task and bool(re.search(r'\b(?:incident|root.cause)\b', prompt, re.I)
                                                   and re.search(r'\blogs?\b', prompt, re.I)
                                                   and re.search(r'\.json\b', prompt, re.I))
-    compact_output = programming_task and bool(re.search(r'(?<!not )\b(?:print|output|return) (?:a )?compact JSON\b', prompt, re.I))
+    compact_output = programming_task and bool(re.search(r'(?<!not )\bcompact JSON\b', prompt, re.I))
     outputs = requested_outputs(prompt, programming_task)
     invalid_csv_probe = (programming_task and bool(re.search(r'\bskip\s+invalid\s+rows\b', prompt, re.I))
                          and '--file' in prompt and bool(re.search(r'\bcount\b', prompt, re.I)))
+    csv_precision_probe = invalid_csv_probe and bool(re.search(r'\bat most\s+(?:two|2)\s+decimal places\b', prompt, re.I))
     cli_probe = (programming_task and '--file' in prompt and bool(re.search(r'\bcount\b', prompt, re.I)))
     missing_file_probe = cli_probe and bool(re.search(r'\bmissing\s+(?:input\s+)?file\b', prompt, re.I))
     unsupported_command_probe = cli_probe and bool(re.search(r'\bunsupported\s+command\b', prompt, re.I))
@@ -604,12 +773,22 @@ def run_agent(prompt, workspace, request=model_request, history=None):
     integer_array = programming_task and bool(re.search(r'\bJSON array of integers\b', prompt, re.I)
                                               and re.search(r'\binvalid\b|non-integer', prompt, re.I))
     strict_json_integers = programming_task and bool(re.search(r'\bJSON (?:array of )?integers\b', prompt, re.I))
+    json_string_input = programming_task and requires_json_string_stdin(prompt)
+    forbid_division = programming_task and forbids_division(prompt)
+    rejection_stderr = programming_task and bool(re.search(r'\b(?:error|message)\b.{0,60}\bstderr\b|'
+                                                         r'\bstderr\b.{0,60}\b(?:error|message)\b', prompt, re.I | re.S))
+    rejection_no_stdout = programming_task and bool(re.search(r'\b(?:no|nothing\s+to)\s+stdout\b|'
+                                                            r'\bprint\s+nothing\s+to\s+stdout\b', prompt, re.I))
+    json_rejection_probe = (programming_task and rejection_stderr
+                            and bool(re.search(r'\binvalid JSON\b', prompt, re.I))
+                            and bool(re.search(r'\bstdin\b|\bstandard input\b', prompt, re.I)))
     checks = CompletionChecks(workspace, outputs, programming_task, prompt if debugging_task else '',
                               validate_json=bool(re.search(r'(?<!\.)\bJSON\b', prompt, re.I)),
                               integer_array=integer_array,
                               money_commands=scalar_money_commands(prompt) if programming_task else (),
                               programming_prompt=prompt if programming_task else '',
-                              strict_json_integers=strict_json_integers)
+                              strict_json_integers=strict_json_integers,
+                              forbid_division=forbid_division)
     system = PROGRAMMING_PROMPT if programming_task else DEBUGGING_PROMPT if debugging_task else SYSTEM_PROMPT
     messages = [{"role": "system", "content": system},
                 *(history or []), {"role": "user", "content": prompt}]
@@ -682,6 +861,8 @@ def run_agent(prompt, workspace, request=model_request, history=None):
     probe_failures = {}
     probed_sources = set()
     cli_probed_sources = set()
+    json_rejection_probed_sources = set()
+    invalid_test_input_failures = 0
     syntax_failure_locations = {}
     for _ in range(MAX_MODEL_CALLS):
         if time.monotonic() >= deadline:
@@ -779,7 +960,7 @@ def run_agent(prompt, workspace, request=model_request, history=None):
                     if result['status'] == 'success' and invalid_csv_probe and initial_csv:
                         source = next((path for path in sorted(outputs) if path.endswith('.py')), None)
                         if source and workspace.file_path(source).read_bytes() not in probed_sources:
-                            probe = probe_invalid_csv_rows(workspace, source, initial_csv)
+                            probe = probe_invalid_csv_rows(workspace, source, initial_csv, csv_precision_probe)
                             if probe:
                                 debug_tool_result('csv_probe', {'path': source}, probe, tool_started)
                                 if probe['status'] == 'error':
@@ -861,8 +1042,32 @@ def run_agent(prompt, workspace, request=model_request, history=None):
                 if name == 'replace_text' and program_failures.get(arguments.get('path'), 0) >= 3:
                     raise ValueError('Repeated small edits have not fixed this program. Read the complete source and use write_file '
                                      'to replace it with a clean implementation, then rerun the failing command. Do not repeat another small patch.')
+                normalized_stdin = None
+                ignored_negative_reference = False
+                if (name == 'run_python' and json_string_input
+                        and arguments.get('expected_exit_code', 0) == 0):
+                    original_stdin = arguments.get('stdin', '')
+                    normalized_stdin = normalize_json_string_stdin(original_stdin)
+                    if normalized_stdin is None:
+                        raise TestInputError('This successful test invocation supplies a JSON value that is not a string. '
+                                             'Set stdin to the exact string "\\"abc\\"" for a three-character example; '
+                                             'do not edit the candidate program to accept another type.')
+                    if normalized_stdin != original_stdin:
+                        arguments = {**arguments, 'stdin': normalized_stdin}
+                if (name == 'run_python' and arguments.get('expected_exit_code', 0) != 0
+                        and 'reference_code' in arguments):
+                    arguments = {key: value for key, value in arguments.items() if key != 'reference_code'}
+                    ignored_negative_reference = True
                 attempted_operation = True
                 result = workspace.execute(name, arguments)
+                if name == 'run_python' and json_string_input:
+                    invalid_test_input_failures = 0
+                if name == 'run_python' and normalized_stdin is not None:
+                    if normalized_stdin != original_stdin:
+                        result['test_input_normalized'] = True
+                        result['normalized_stdin'] = normalized_stdin
+                if ignored_negative_reference:
+                    result['reference_ignored_for_negative_test'] = True
                 if debugging_task:
                     checks.observe(result)
                 if name in ('update_csv', 'remove_csv_rows', 'copy_csv'):
@@ -888,6 +1093,22 @@ def run_agent(prompt, workspace, request=model_request, history=None):
                     result['format_error'] = compact_json_error(result['stdout'])
                 if name == 'run_python' and not result.get('format_error'):
                     result['format_error'] = checks.output_error(arguments, result)
+                if name == 'run_python' and arguments.get('expected_exit_code', 0) != 0:
+                    if rejection_stderr and not result.get('stderr', '').strip():
+                        result['format_error'] = 'The task requires a useful error on stderr for invalid input; stderr is empty.'
+                    elif rejection_stderr and 'Traceback' in result.get('stderr', ''):
+                        result['format_error'] = 'The task requires a useful stderr error, not a Python traceback.'
+                    elif rejection_no_stdout and result.get('stdout'):
+                        result['format_error'] = 'The task requires no stdout for invalid input; print the error to stderr.'
+                if (name == 'run_python' and compact_output and not result.get('format_error')
+                        and result.get('outputs_match') is False and result.get('exit_code') == 0
+                        and result.get('reference', {}).get('exit_code') == 0
+                        and not result.get('timed_out') and not result.get('output_truncated')
+                        and not result['reference'].get('timed_out')
+                        and not result['reference'].get('output_truncated')
+                        and same_json_value(result['stdout'], result['reference']['stdout'])):
+                    result['outputs_match'] = True
+                    result['reference_json_format_ignored'] = True
                 candidate_failed = name in ('run_python', 'analyze_python') and (
                     result['exit_code'] != arguments.get('expected_exit_code', 0)
                     or result['timed_out'] or result['output_truncated'] or result.get('format_error'))
@@ -898,7 +1119,7 @@ def run_agent(prompt, workspace, request=model_request, history=None):
                         and arguments['path'] in outputs and arguments['path'].endswith('.py')):
                     source_bytes = workspace.file_path(arguments['path']).read_bytes()
                     if source_bytes not in probed_sources:
-                        probe = probe_invalid_csv_rows(workspace, arguments['path'], initial_csv)
+                        probe = probe_invalid_csv_rows(workspace, arguments['path'], initial_csv, csv_precision_probe)
                         if probe:
                             result['csv_probe'] = {key: value for key, value in probe.items()
                                                    if key != 'current_source'}
@@ -935,6 +1156,42 @@ def run_agent(prompt, workspace, request=model_request, history=None):
                                 raise AgentError('CLI rejection probe failed three times without a source repair.')
                         else:
                             cli_probed_sources.add(source_bytes)
+                if (name == 'run_python' and not execution_failed and json_rejection_probe
+                        and arguments['path'] in outputs and arguments['path'].endswith('.py')):
+                    source_bytes = workspace.file_path(arguments['path']).read_bytes()
+                    if source_bytes not in json_rejection_probed_sources:
+                        probe = probe_invalid_json_rejection(workspace, arguments['path'], rejection_no_stdout)
+                        result['json_rejection_probe'] = {key: value for key, value in probe.items()
+                                                          if key != 'current_source'}
+                        if probe['status'] == 'error':
+                            result['probe_error'] = probe['message']
+                            result['probe_case'] = probe['probe_case']
+                            result['current_source'] = probe['current_source']
+                            candidate_failed = execution_failed = True
+                            signature = ('json', source_bytes)
+                            probe_failures[signature] = probe_failures.get(signature, 0) + 1
+                            if probe_failures[signature] >= 3:
+                                raise AgentError('Invalid JSON rejection failed three times without a source repair.')
+                        else:
+                            json_rejection_probed_sources.add(source_bytes)
+                if (name == 'run_python' and not execution_failed and checks.money_zero_pending
+                        and initial_csv and '--category' in checks.required_options
+                        and arguments['path'] in outputs and arguments['path'].endswith('.py')):
+                    for command in sorted(checks.money_zero_pending):
+                        probe = probe_zero_money_selection(workspace, arguments['path'], initial_csv, command)
+                        result['money_zero_probe'] = {key: value for key, value in probe.items()
+                                                      if key != 'current_source'}
+                        if probe['status'] == 'error':
+                            result['probe_error'] = probe['message']
+                            result['probe_case'] = probe['probe_case']
+                            result['current_source'] = probe['current_source']
+                            candidate_failed = execution_failed = True
+                            signature = ('zero', workspace.file_path(arguments['path']).read_bytes(), command)
+                            probe_failures[signature] = probe_failures.get(signature, 0) + 1
+                            if probe_failures[signature] >= 3:
+                                raise AgentError('Zero-money probe failed three times without a source repair.')
+                            break
+                        checks.money_zero_pending.discard(command)
                 if name == 'run_python':
                     reference = result.get('reference', {})
                     if (not candidate_failed and 'reference_code' in arguments
@@ -945,6 +1202,8 @@ def run_agent(prompt, workspace, request=model_request, history=None):
                         repeats = prior[1] + 1 if prior and prior[0] == failure else 1
                         reference_failures[key] = (failure, repeats)
                         result['reference_failure_repeats'] = repeats
+                        if repeats >= 2:
+                            result['failed_test'] = arguments
                         if repeats >= 3:
                             raise AgentError('Independent reference failed three times with the same error. '
                                              'The candidate result was preserved, but its output was not verified. '
@@ -1027,6 +1286,13 @@ def run_agent(prompt, workspace, request=model_request, history=None):
                     path = arguments.get('path') if isinstance(arguments, dict) else None
                     program_failures[path] = program_failures.get(path, 0) + 1
                 result = {"status": "error", "message": str(exc)}
+                if isinstance(exc, TestInputError):
+                    invalid_test_input_failures += 1
+                    if invalid_test_input_failures >= 3:
+                        raise AgentError('Three consecutive expected-success tests supplied non-string JSON input. '
+                                         'The candidate was not evaluated on a valid input.')
+                    result['test_input_error'] = True
+                    result['failed_test'] = arguments
                 if (programming_task and isinstance(exc, FileNotFoundError)
                         and call.get('function', {}).get('name') == 'replace_text'):
                     result['create_required'] = arguments.get('path')

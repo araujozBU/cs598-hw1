@@ -1,6 +1,6 @@
 # Checkpoint 3 coverage
 
-Run the seven end-to-end tasks with:
+Run the ten end-to-end tasks with:
 
 ```sh
 RUN_FINAL_LIVE_TESTS=1 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p test_final_live.py -v
@@ -47,6 +47,19 @@ It checks overlap at endpoints, disjoint and nested intervals, negatives, empty
 input, deterministic random cases against an interval-graph oracle, compact JSON,
 and strict rejection of malformed intervals. Its output checks do not prove the
 requested O(n log n) complexity.
+
+The product_except_self.py task checks zero, two zeros, negative values,
+singletons, empty input, seeded arrays, compact JSON, and strict input types.
+Expected values come from an independent per-index product oracle. The
+longest_unique_substring.py task checks repeated characters, case sensitivity,
+Unicode code points (including combining marks), empty input, seeded strings,
+and invalid JSON types against a simple exhaustive substring oracle. Output
+checks alone do not prove either requested time bound.
+
+The import-pipeline debugging task changes the incident domain and schema. It
+requires following request, trace, task, and attempt IDs, then distinguishing
+the causal transform error from a successful storage branch and unrelated
+failures. The expected report is built from the synthetic log evidence.
 
 Passing these tests cannot guarantee the six unreleased requirements in either
 category, all possible inputs, model reliability, or performance in the grader's

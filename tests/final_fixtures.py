@@ -123,6 +123,112 @@ unrelated files. Test the saved program before finishing.
 '''
 
 
+PRODUCT_EXCEPT_SELF_PROGRAM = '''Implement product_except_self.py in the current directory using Python 3's standard library.
+This is a standalone programming practice task; no data file is supplied.
+
+Invocation: python3 product_except_self.py
+Read one JSON array of integers from stdin. For each index, output the product of all
+other elements. Do not use division. An empty array prints []; a one-element array
+prints [1]. Zeros and negative integers are valid. Use O(n) time apart from
+integer multiplication costs. Print one compact JSON array followed by a newline,
+with no other stdout.
+
+On invalid JSON or a non-integer array, including booleans, floats, and strings,
+exit nonzero, print a useful error to stderr, and print nothing to stdout.
+Preserve unrelated files. Test the saved program before finishing.
+'''
+
+
+LONGEST_UNIQUE_SUBSTRING_PROGRAM = '''Implement longest_unique_substring.py in the current directory using Python 3's standard library.
+This is a standalone programming practice task; no data file is supplied.
+
+Invocation: python3 longest_unique_substring.py
+Read one JSON string from stdin. Print the length of its longest contiguous
+substring containing no repeated Unicode code points, followed by a newline.
+Treat characters exactly as decoded by json.loads: do not normalize Unicode or
+change case. An empty string prints 0. Use an O(n) sliding-window algorithm.
+
+On invalid JSON or a JSON value that is not a string, exit nonzero, print a
+useful error to stderr, and print nothing to stdout. Preserve unrelated files.
+Test the saved program before finishing.
+'''
+
+
+def import_pipeline_debugging_fixture(root):
+    """A failed batch import with a successful storage branch and decoy attempts."""
+    expected = {
+        'api_request_id': 'api-7142',
+        'trace_id': 'trace-68af',
+        'task_id': 'task-2057',
+        'attempt_id': 'att-9f21',
+        'worker': 'etl-w4',
+        'root_cause_component': 'SchemaRegistry',
+        'error_code': 'SCHEMA_VERSION_MISSING',
+        'schema_version': 'v7',
+        'root_cause_timestamp': '2026-10-02T10:15:02.125Z',
+        'retry_delay_ms': 1500,
+        'storage_batch_id': 'batch-882',
+        'storage_status': 'committed',
+    }
+    logs = root / 'logs'
+    logs.mkdir()
+    evidence = {
+        'api': [
+            '2026-10-02T10:14:00Z INFO req=api-success method=POST path=/api/import job=job-4921 status=200 trace=trace-old',
+            '2026-10-02T10:15:04Z ERROR req=api-7142 method=POST path=/api/import job=job-4921 status=500',
+            '2026-10-02T10:15:04Z WARN req=api-7142 trace=trace-68af upstream_status=500',
+            '2026-10-02T10:15:04Z ERROR req=api-decoy method=POST path=/api/import job=job-other status=500 trace=trace-decoy',
+        ],
+        'scheduler': [
+            '2026-10-02T10:14:00Z INFO trace=trace-old task=task-old worker=etl-w2 result=complete',
+            '2026-10-02T10:15:00Z INFO trace=trace-68af storage_batch=batch-882',
+            '2026-10-02T10:15:01Z INFO trace=trace-68af task=task-2057 attempt=att-9f21 worker=etl-w4',
+            '2026-10-02T10:15:04Z ERROR trace=trace-68af task=task-2057 attempt=att-9f21 result=failed retry_delay_ms=1500',
+            '2026-10-02T10:15:04Z ERROR trace=trace-decoy task=task-decoy attempt=att-decoy result=failed retry_delay_ms=9000',
+        ],
+        'transform': [
+            '2026-10-02T10:14:00Z ERROR worker=etl-w4 task=task-old attempt=att-old component=DiskWriter code=DISK_FULL',
+            '2026-10-02T10:15:01Z INFO worker=etl-w4 task=task-2057 attempt=att-9f21 schema_version=v7',
+            '2026-10-02T10:15:02.125Z ERROR worker=etl-w4 task=task-2057 attempt=att-9f21 component=SchemaRegistry code=SCHEMA_VERSION_MISSING schema_version=v7',
+            '2026-10-02T10:15:03Z ERROR worker=etl-w8 task=task-decoy attempt=att-decoy component=Parser code=BAD_RECORD',
+        ],
+        'storage': [
+            '2026-10-02T10:14:01Z INFO batch=batch-old status=committed',
+            '2026-10-02T10:15:02Z INFO batch=batch-882 status=committed rows=1200',
+            '2026-10-02T10:15:03Z ERROR batch=batch-decoy status=failed code=WRITE_TIMEOUT',
+        ],
+    }
+    for service, rows in evidence.items():
+        lines = [f'2026-10-02T10:13:00Z INFO service={service} background={i} status=ok\n'
+                 for i in range(1200)]
+        for index, row in enumerate(rows):
+            lines.insert(200 + index * 180, row + '\n')
+        (logs / (service + '.log')).write_text(''.join(lines))
+    prompt = '''Incident: the batch import for job job-4921 failed at 2026-10-02 10:15 UTC.
+The client received HTTP 500 for POST /api/import. Investigate logs/api.log,
+logs/scheduler.log, logs/transform.log, and logs/storage.log. An earlier import
+for the same job succeeded; other errors and attempts are unrelated. Follow
+the failed request's linked identifiers and distinguish the failed transform
+from the storage branch. Write REPORT.json in the current directory as one
+JSON object with exactly these keys and value types:
+1. api_request_id: req= for the failed import request (string).
+2. trace_id: trace linked to that request (string).
+3. task_id: task linked to that trace's failed attempt (string).
+4. attempt_id: attempt linked to that task and trace (string).
+5. worker: worker for that failed attempt (string).
+6. root_cause_component: class named by the causal transform error (string).
+7. error_code: code from that same transform error (string).
+8. schema_version: version from that same transform error (string).
+9. root_cause_timestamp: exact timestamp of that error (string).
+10. retry_delay_ms: retry delay from the scheduler error (JSON integer).
+11. storage_batch_id: batch linked to the failed trace (string).
+12. storage_status: status for that batch in the storage log (string).
+Copy values exactly from the evidence, preserve all inputs, and write the file
+before finishing.
+'''
+    return prompt, expected
+
+
 def chained_debugging_fixture(root):
     """Require service links, paginated evidence, and time/dispatch disambiguation."""
     prompt, expected = debugging_fixture(root, alternate=True)
