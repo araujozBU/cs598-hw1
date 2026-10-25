@@ -181,6 +181,28 @@ class FinalToolTests(unittest.TestCase):
         self.assertIsNone(checks.source_review(source.replace('print(int(a.value))',
                                               'print([int(x) for x in a.value])'), 'app.py'))
 
+    def test_nested_json_integers_reject_boolean_endpoints_at_source_review(self):
+        broken = ("import json, sys\npairs = json.loads(sys.stdin.read())\n"
+                  "if any(not isinstance(value, int) for pair in pairs for value in pair):\n"
+                  "    sys.exit(1)\nprint('[]')\n")
+        fixed = broken.replace('isinstance(value, int)', '(type(value) is int)')
+        replies = iter([
+            self.call('write_file', path='intervals.py', content=broken),
+            self.call('replace_text', path='intervals.py', old='isinstance(value, int)',
+                      new='(type(value) is int)'),
+            self.call('run_python', path='intervals.py', stdin='[[true,3]]', expected_exit_code=1),
+            self.call('run_python', path='intervals.py', stdin='[[1,3]]'),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        history = []
+        result = run_agent('Implement intervals.py. Read an array of pairs of JSON integers from stdin. '
+                           'Booleans are invalid.', self.workspace,
+                           request=lambda messages, deadline: next(replies), history=history)
+        self.assertEqual(result['message'], 'Verified.')
+        self.assertEqual((self.root / 'intervals.py').read_text(), fixed)
+        self.assertTrue(any('also accepts booleans' in message['content'] for message in history
+                            if message['role'] == 'tool'))
+
     def test_repeated_identical_mismatch_returns_to_repair_instead_of_review(self):
         check = {'outputs_match': False, 'exit_code': 0, 'stdout': '4',
                  'reference': {'exit_code': 0, 'stdout': '3'}, 'repeat_failure': True}
@@ -553,7 +575,7 @@ class FinalToolTests(unittest.TestCase):
 
     def test_incorrect_reference_can_be_repaired_without_changing_program(self):
         c = self.call
-        self.scripted('Implement answer.py that prints 4.', [
+        history = self.scripted('Implement answer.py that prints 4.', [
             c('write_file', path='answer.py', content='print(4)'),
             c('run_python', path='answer.py', reference_code='print(5)'),
             c('review_mismatch', decision='repair_reference', reason='The task requests 4, but the reference prints 5.'),
@@ -561,6 +583,30 @@ class FinalToolTests(unittest.TestCase):
             c('finish', status='success', message='Verified.'),
         ])
         self.assertEqual((self.root / 'answer.py').read_text(), 'print(4)')
+        reviews = [json.loads(message['content']) for message in history if message['role'] == 'tool'
+                   and 'repair_reference_required' in json.loads(message['content'])]
+        self.assertEqual(reviews[0]['candidate_result']['stdout'], '4\n')
+        self.assertEqual(reviews[0]['reference_result']['stdout'], '5\n')
+
+    def test_reference_repair_context_preserves_formatting_mismatch(self):
+        review = {'repair_reference_required': True, 'reason': 'The reference prints a Python list, not tabular text.',
+                  'failed_test': {'path': 'answer.py', 'args': ['top', '3'],
+                                  'reference_code': 'print(rows)'},
+                  'candidate_result': {'stdout': 'food\t1.00\n', 'stderr': ''},
+                  'reference_result': {'stdout': "[('food', Decimal('1.00'))]\n", 'stderr': ''}}
+        messages = [{'role': 'system', 'content': PROGRAMMING_PROMPT},
+                    {'role': 'user', 'content': 'Implement answer.py with tabular top output.'},
+                    self.call('review_mismatch', decision='repair_reference', reason=review['reason']),
+                    {'role': 'tool', 'tool_call_id': 'review_mismatch', 'content': json.dumps(review)}]
+        with patch('agent.request_completion', return_value={}) as requested:
+            model_request(messages, time.monotonic() + 5)
+        repair_messages, repair_tools = requested.call_args.args[:2]
+        repair_context = json.loads(repair_messages[-1]['content'])
+        self.assertEqual(repair_context['candidate_result']['stdout'], 'food\t1.00\n')
+        self.assertEqual(repair_context['reference_result']['stdout'], "[('food', Decimal('1.00'))]\n")
+        self.assertIn('Python list', repair_context['review_reason'])
+        self.assertEqual({tool['function']['name'] for tool in repair_tools},
+                         {'run_python', 'read_lines', 'read_file', 'analyze_python'})
 
     def test_programming_mismatch_is_reviewed_in_a_fresh_context(self):
         messages = [{'role': 'system', 'content': PROGRAMMING_PROMPT},

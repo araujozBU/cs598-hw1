@@ -35,7 +35,7 @@ def scalar_money_commands(prompt):
 
 class CompletionChecks:
     def __init__(self, workspace, outputs, programming, report_prompt='', validate_json=False, integer_array=False,
-                 money_commands=(), programming_prompt=''):
+                 money_commands=(), programming_prompt='', strict_json_integers=False):
         self.workspace = workspace
         self.outputs = outputs
         self.programming = programming
@@ -49,6 +49,7 @@ class CompletionChecks:
         self.evidence = set()
         self.validate_json = validate_json or bool(report_prompt)
         self.integer_array = integer_array
+        self.strict_json_integers = strict_json_integers or integer_array
         self.integer_input_checks = {'boolean', 'float', 'string'} if integer_array else set()
         self.valid_integer_args = {}
         self.money_commands = set(money_commands)
@@ -193,7 +194,7 @@ class CompletionChecks:
                              'for the option names cannot work.')
                     self.source_errors[path] = error
                     return {'validation_error': error, 'unused_options': unused}
-        if not self.integer_array:
+        if not self.strict_json_integers:
             return None
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Name) and node.func.id == 'isinstance' and len(node.args) == 2]
