@@ -25,6 +25,7 @@ library. No agent SDK or additional Python packages are required.
 - `tests/final_fixtures.py` and `tests/fixtures/`: reproducible synthetic inputs and task prompts.
 - `scripts/prepare_final_fixture.py`: creates a manual final-checkpoint workspace.
 - `scripts/run_tests.py`: offline or full live suite, with spacing between live turns.
+- `scripts/test_programming_repair.py`: small live diagnostic for repairing a seeded shadowing defect without losing correct output.
 - `walkthrough.md`: a step-by-step explanation of the harness and an example request.
 
 Tested environment: macOS 15.7.3 with Python 3.13.7. Linux has not yet been tested.
@@ -195,6 +196,32 @@ repair action, distinguishing candidate defects from broken reference calculatio
 This review uses the same Qwen model endpoint and counts toward the 120-call cap.
 An identical repeated failure returns current source for repair instead of forcing
 another identical review. The failed check remains pending until resolved.
+Concrete runtime, syntax and source-validation failures receive a focused repair
+request containing the original task, current numbered source and exact error,
+without stale code from earlier attempts. Reviewed candidate-output defects use
+the same repair step. It uses the same Qwen endpoint and existing model-call/time
+budget, then resumes the normal verification loop; a repair still has to pass
+the original failing check, including its output comparison.
+For a focused live repair check, run `python3 scripts/test_programming_repair.py`
+with the normal course environment variables. It seeds a small broken program
+and verifies the model's repair within two minutes; it does not replace the full
+generation tests. Repeated-check detection compares source and test inputs, so
+changing memory addresses in error output cannot disguise an unchanged failure.
+Use `python3 scripts/test_programming_repair.py --case reference` to check that
+a broken reference calculation is repaired without editing a correct program.
+Use `python3 scripts/test_programming_repair.py --case parser` to reproduce a
+competing-positional-arguments bug and verify the repair preserves a command
+that does not take the optional value. Repair context includes bounded previously
+verified command outputs as examples to preserve; these observations are not
+proof that the edited program still passes. Source review detects an unused greedy
+positional argument before an optional positional argument, which would consume
+that value and provides an exact suggested edit. A rewrite resets earlier failed
+patch attempts so remaining repairs are not blocked by stale counters. Attempts
+to patch a nonexistent source file are routed to file creation with the full
+programming guidance. Planning also routes directly to creation when a requested
+Python deliverable does not exist. Programming guidance
+also calls for small malformed-input fixtures
+before relying on checks against a large clean dataset.
 This avoids asking the model to guess or manually
 transcribe expected totals. Independent live tests still fail on any incorrect
 output. Explicit requests to print compact JSON also receive a format check.
@@ -246,8 +273,10 @@ and at most 120 successful completions per invocation. The overall 290-second
 timer leaves margin below the final checkpoint's 300-second limit. Transient HTTP
 429/502/503/504 responses receive at most two retries within that timer. Large
 file reads and CSV previews are bounded; calculations still use the full CSV.
-Older large tool results are shortened when conversation text grows. This is a
-character-based context heuristic, not an exact Qwen tokenizer count. Large
+Older large tool results are shortened when conversation text grows. Programming
+runs also discard obsolete intermediate attempts while preserving the complete
+task, previous conversations, recorded plan, latest tool exchange and exact pending
+checks. This is a character-based context heuristic, not an exact Qwen tokenizer count. Large
 inputs above 40,000 bytes receive an 8,000-byte preview through `read_file`;
 files within the earlier checkpoint's 40,000-byte allowance remain complete.
 Programming prompts receive a bounded workspace inventory and CSV preview with
@@ -258,7 +287,9 @@ Programming requests use temperature 0.2 and top-p 0.8 to reduce variation betwe
 independent generations. Repeated syntax-breaking edits count toward the clean-rewrite
 threshold. Rejected HTML HTTP 400 responses reporting bad HTTP request syntax
 receive at most four retries within the same task deadline; ordinary HTTP 400
-validation errors do not. The client closes rejected responses and requests fresh,
+validation errors do not. A reported context overflow is distinguished from gateway
+failures: programming runs compact their working history and retry at most twice
+within the existing task deadline. The client closes rejected responses and requests fresh,
 uncached connections. Debug output identifies framing failures without copying
 the gateway's echoed request contents. This is recovery for an endpoint problem,
 not a guarantee that an unavailable gateway can be repaired by the harness.

@@ -1,6 +1,7 @@
 """Completion evidence for requested deliverables and saved-program checks."""
 
 import ast
+import hashlib
 import json
 import re
 
@@ -41,6 +42,7 @@ class CompletionChecks:
         self.written = set()
         self.untested = set()
         self.failed_tests = {}
+        self.passed_tests = {}
         self.report_keys = set(re.findall(r'^\s*\d+\.\s*(?:\*\*)?[`\"]?([A-Za-z_]\w*)[`\"]?\s*(?:\*\*)?\s*[:—–-]',
                                           report_prompt, re.M))
         self.exact_evidence = bool(re.search(r'\b(?:copy values exactly|exactly (?:from|as))\b', report_prompt, re.I))
@@ -79,6 +81,11 @@ class CompletionChecks:
         return [{'arguments': item['arguments'], 'reference_required': item['requires_reference']}
                 for item in self.failed_tests.values()]
 
+    def working_examples(self, path):
+        """Bounded previous observations for repair context, not proof of current correctness."""
+        path = str(self.workspace.file_path(path))
+        return [value for key, value in self.passed_tests.items() if key[0] == path][-12:]
+
     def source_review(self, source, path):
         tree = ast.parse(source)
         self.source_errors.pop(path, None)
@@ -88,7 +95,7 @@ class CompletionChecks:
         attributes = {node.func.attr for node in calls if isinstance(node.func, ast.Attribute)}
         declarations = [node for node in calls if isinstance(node.func, ast.Attribute)
                         and node.func.attr == 'add_argument']
-        if (self.required_options and declarations and 'ArgumentParser' in attributes
+        if (declarations and 'ArgumentParser' in attributes
                 and attributes.intersection({'parse_args', 'parse_intermixed_args'})
                 and not attributes.intersection({'parse_known_args', 'parse_known_intermixed_args'})
                 and all(node.args and all(isinstance(arg, ast.Constant) and isinstance(arg.value, str)
@@ -121,6 +128,27 @@ class CompletionChecks:
                 used = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
                         and isinstance(node.value, ast.Name) and node.value.id == namespace
                         and isinstance(node.ctx, ast.Load)}
+                positional = [d for d in declarations if ast.dump(d.func.value) == parser
+                              and not d.args[0].value.startswith('-')]
+                for index, declaration in enumerate(positional):
+                    keywords = {kw.arg: kw.value for kw in declaration.keywords}
+                    nargs = keywords.get('nargs')
+                    dest = keywords.get('dest', declaration.args[0])
+                    if (isinstance(nargs, ast.Constant) and nargs.value == '*'
+                            and isinstance(dest, ast.Constant) and dest.value not in used
+                            and any(any(kw.arg == 'nargs' and isinstance(kw.value, ast.Constant)
+                                        and kw.value.value == '?' for kw in later.keywords)
+                                    for later in positional[index + 1:])):
+                        error = ('Unused greedy positional consumes the following optional value: '
+                                 + ast.get_source_segment(source, declaration)
+                                 + '. Remove this unused add_argument declaration. Keep the later value optional '
+                                 'globally and require it only in the command handler that needs it. '
+                                 'Do not convert a required positional interface to a --flag.')
+                        self.source_errors[path] = error
+                        return {'validation_error': error,
+                                'suggested_tool_call': {'name': 'replace_text', 'arguments': {
+                                    'path': path, 'old': ast.get_source_segment(source, declaration),
+                                    'new': 'pass  # Removed unused greedy positional.'}}}
                 unused = {}
                 for declaration in declarations:
                     if ast.dump(declaration.func.value) != parser:
@@ -183,17 +211,24 @@ class CompletionChecks:
         if failed:
             # Keep a failed comparison pending even if a later invocation only
             # checks the exit code or a different command happens to work.
+            self.passed_tests.pop(key, None)
             previous = self.failed_tests.get(key, {})
             signature = (result.get('stdout'), result.get('stderr'),
                          result.get('reference', {}).get('stdout'), result.get('reference', {}).get('stderr'))
-            result['repeat_failure'] = previous.get('signature') == signature
+            attempt_signature = (hashlib.sha256(self.workspace.file_path(arguments['path']).read_bytes()).hexdigest(),
+                                 arguments.get('reference_code'), arguments.get('expected_exit_code', 0))
+            result['repeat_failure'] = previous.get('attempt_signature') == attempt_signature
             self.failed_tests[key] = {
                 'signature': signature,
+                'attempt_signature': attempt_signature,
                 'requires_reference': compared or previous.get('requires_reference', False),
                 'arguments': {**arguments, 'path': str(self.workspace.file_path(arguments['path']).relative_to(self.workspace.root))}}
             self.untested.add(path)
         elif key not in self.failed_tests or not self.failed_tests[key]['requires_reference'] or compared or negative:
             self.failed_tests.pop(key, None)
+            if compared and result.get('outputs_match') is True:
+                self.passed_tests[key] = {'args': list(key[1]), 'stdin': key[2][:2000],
+                                          'stdout': result['stdout'][:2000]}
             self.untested.discard(path)
             if arguments.get('expected_exit_code', 0) == 0 and result['stdout'].strip() == '0.00':
                 self.money_zero_pending.difference_update(arguments.get('args', []))

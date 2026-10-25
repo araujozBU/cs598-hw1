@@ -14,7 +14,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from agent import AgentError, MAX_MODEL_CALLS, PROGRAMMING_PROMPT, Workspace, is_programming_request, model_request, run_agent
-from model_client import parse_completion, request_completion
+from model_client import ContextLimitError, parse_completion, request_completion
 from completion_checks import CompletionChecks
 
 
@@ -90,6 +90,34 @@ class FinalToolTests(unittest.TestCase):
         for number in result['matched_lines']:
             self.assertTrue(any(line['line'] == number and line['text'] == 'hit' for line in result['lines']))
 
+    def test_missing_source_repair_requires_creation(self):
+        messages = [{'role': 'system', 'content': PROGRAMMING_PROMPT},
+                    {'role': 'user', 'content': 'Implement app.py to print 7.'},
+                    {'role': 'tool', 'content': json.dumps({'create_required': 'app.py'})}]
+        with patch('agent.request_completion', return_value={}) as request:
+            model_request(messages, time.monotonic() + 10)
+        args, kwargs = request.call_args
+        self.assertEqual(kwargs['tool_choice']['function']['name'], 'write_file')
+        self.assertEqual([tool['function']['name'] for tool in args[1]], ['write_file'])
+        self.assertIn('Implement app.py to print 7.', args[0][1]['content'])
+        self.assertIn(PROGRAMMING_PROMPT, args[0][0]['content'])
+        messages[-1]['content'] = json.dumps({'missing_source_files': ['app.py']})
+        with patch('agent.request_completion', return_value={}) as request:
+            model_request(messages, time.monotonic() + 10)
+        self.assertEqual(request.call_args.kwargs['tool_choice']['function']['name'], 'write_file')
+
+    def test_repair_examples_keep_verified_commands_and_drop_failed_ones(self):
+        checks = CompletionChecks(self.workspace, set(), True)
+        (self.root / 'app.py').write_text('print(3)')
+        arguments = {'path': 'app.py', 'args': ['count'], 'reference_code': 'print(3)'}
+        checks.tested(arguments, {'stdout': '3\n', 'exit_code': 0, 'outputs_match': True}, False)
+        checks.changed('app.py')
+        self.assertEqual(checks.working_examples('app.py'),
+                         [{'args': ['count'], 'stdin': '', 'stdout': '3\n'}])
+        self.assertEqual(checks.working_examples('other.py'), [])
+        checks.tested(arguments, {'stdout': '4\n', 'exit_code': 0, 'outputs_match': False}, True)
+        self.assertEqual(checks.working_examples('app.py'), [])
+
     def test_undeclared_cli_options_fail_source_review_until_repaired(self):
         checks = CompletionChecks(self.workspace, set(), True, programming_prompt='Implement app.py with --region and --until.')
         source = "import argparse\np = argparse.ArgumentParser()\np.add_argument('rest', nargs='*')\na = p.parse_intermixed_args()\n"
@@ -106,6 +134,25 @@ class FinalToolTests(unittest.TestCase):
                        "import argparse\np = argparse.ArgumentParser()\nflag = '--region'\np.add_argument(flag)\np.parse_args()"]:
             with self.subTest(source=source):
                 self.assertIsNone(checks.source_review(source, 'app.py'))
+
+    def test_unused_greedy_positional_cannot_swallow_optional_value(self):
+        checks = CompletionChecks(self.workspace, set(), True, programming_prompt='Implement app.py with --file.')
+        source = ("import argparse\np=argparse.ArgumentParser()\np.add_argument('command')\n"
+                  "p.add_argument('rest', nargs='*')\np.add_argument('number', nargs='?')\n"
+                  "p.add_argument('--file')\na=p.parse_intermixed_args()\nprint(a.command,a.number,a.file)\n")
+        self.assertIn('Unused greedy positional', checks.source_review(source, 'app.py')['validation_error'])
+        (self.root / 'app.py').write_text(source)
+        before = self.workspace.execute('run_python', {'path': 'app.py', 'args': ['top', '3']})
+        self.assertEqual(before['stdout'], 'top None None\n')
+        fixed = source.replace("p.add_argument('rest', nargs='*')\n", '')
+        self.assertIsNone(checks.source_review(fixed, 'app.py'))
+        (self.root / 'app.py').write_text(fixed)
+        after = self.workspace.execute('run_python', {'path': 'app.py', 'args': ['top', '3']})
+        self.assertEqual(after['stdout'], 'top 3 None\n')
+        count = self.workspace.execute('run_python', {'path': 'app.py', 'args': ['count']})
+        self.assertEqual(count['exit_code'], 0)
+        self.assertEqual(count['stdout'], 'count None None\n')
+        self.assertIsNone(checks.source_review(source + 'print(a.rest)\n', 'app.py'))
 
     def test_declared_option_must_be_used_by_command_handler(self):
         checks = CompletionChecks(self.workspace, set(), True, programming_prompt='Implement app.py with --region.')
@@ -126,6 +173,130 @@ class FinalToolTests(unittest.TestCase):
             model_request(messages, time.monotonic() + 60)
         self.assertIs(requested.call_args.args[0], messages)
         self.assertNotIn('tool_choice', requested.call_args.kwargs)
+
+    def test_runtime_repair_uses_current_source_in_fresh_context(self):
+        messages = [{'role': 'system', 'content': PROGRAMMING_PROMPT},
+                    {'role': 'user', 'content': 'Implement app.py.'},
+                    {'role': 'assistant', 'content': 'Stale source and failed guesses.'},
+                    self.call('run_python', path='app.py'),
+                    {'role': 'tool', 'tool_call_id': 'run_python', 'content': json.dumps({
+                        'status': 'error', 'repair_required': True, 'stderr': 'UnboundLocalError',
+                        'current_source': {'lines': [{'line': 1, 'text': 'print(current_code)'}]}})}]
+        with patch('agent.request_completion', return_value=self.call('replace_text', path='app.py', old='a', new='b')) as requested:
+            model_request(messages, time.monotonic() + 60)
+        repair_messages, repair_tools = requested.call_args.args[:2]
+        self.assertEqual(len(repair_messages), 2)
+        self.assertNotIn('Stale source', json.dumps(repair_messages))
+        self.assertIn('print(current_code)', json.dumps(repair_messages))
+        self.assertEqual({tool['function']['name'] for tool in repair_tools}, {'read_lines', 'write_file', 'replace_text'})
+
+    def test_reference_failure_cannot_offer_program_editing_tools(self):
+        messages = [{'role': 'system', 'content': PROGRAMMING_PROMPT},
+                    {'role': 'user', 'content': 'Implement app.py.'},
+                    self.call('run_python', path='app.py', reference_code='print(missing_import)'),
+                    {'role': 'tool', 'tool_call_id': 'run_python', 'content': json.dumps({
+                        'outputs_match': False, 'exit_code': 0, 'stdout': '4\n',
+                        'reference': {'exit_code': 1, 'stdout': '', 'stderr': 'NameError'}})}]
+        with patch('agent.request_completion', return_value={}) as requested:
+            model_request(messages, time.monotonic() + 60)
+        repair_messages, repair_tools = requested.call_args.args[:2]
+        self.assertEqual(len(repair_messages), 2)
+        self.assertIn('print(missing_import)', json.dumps(repair_messages))
+        self.assertEqual({tool['function']['name'] for tool in repair_tools},
+                         {'run_python', 'read_lines', 'read_file', 'analyze_python'})
+
+    def test_runtime_failure_supplies_current_source_to_repair_step(self):
+        history = self.scripted('Implement answer.py that prints 4.', [
+            self.call('write_file', path='answer.py', content='print(missing_name)'),
+            self.call('run_python', path='answer.py'),
+            self.call('replace_text', path='answer.py', old='missing_name', new='4'),
+            self.call('run_python', path='answer.py'),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        failures = [json.loads(m['content']) for m in history if m['role'] == 'tool' and 'repair_required' in m['content']]
+        self.assertTrue(failures[0]['repair_required'])
+        self.assertEqual(failures[0]['current_source']['lines'][0]['text'], 'print(missing_name)')
+
+    def test_context_recovery_preserves_task_history_and_failed_check(self):
+        calls = 0
+        history = [{'role': 'user', 'content': 'My project code is Cedar.'},
+                   {'role': 'assistant', 'content': 'I will remember Cedar.'}]
+        task = 'Implement answer.py that prints 4.'
+        def request(messages, deadline):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return self.call('write_file', path='answer.py', content='print(5)')
+            if calls == 2:
+                return self.call('run_python', path='answer.py', reference_code='print(4)')
+            if calls == 3:
+                raise ContextLimitError('maximum context length')
+            if calls == 4:
+                self.assertIn('Cedar', json.dumps(messages))
+                self.assertIn(task, json.dumps(messages))
+                self.assertIn('Current execution state', json.dumps(messages))
+                self.assertIn('reference_required', json.dumps(messages))
+                return self.call('replace_text', path='answer.py', old='print(5)', new='print(4)')
+            if calls == 5:
+                return self.call('run_python', path='answer.py', reference_code='print(4)')
+            return self.call('finish', status='success', message='Verified.')
+        result = run_agent(task, self.workspace, request=request, history=history)
+        self.assertEqual(result['status'], 'success')
+        self.assertEqual(history[0]['content'], 'My project code is Cedar.')
+
+    def test_partial_shadowing_repair_must_preserve_both_outputs(self):
+        source = ('def aggregate(values):\n    return sum(values)\n'
+                  'def main():\n    print(aggregate([3, 4]))\n'
+                  '    for label, aggregate in [("sample", 9)]:\n'
+                  '        print(label, aggregate)\nmain()\n')
+        check = {'path': 'answer.py', 'reference_code': 'print(sum([3,4])); print("sample",9)'}
+        history = self.scripted('Implement answer.py to print the sum of [3,4], then sample and 9.', [
+            self.call('write_file', path='answer.py', content=source),
+            self.call('run_python', **check),
+            self.call('replace_text', path='answer.py', old='for label, aggregate in', new='for label, value in'),
+            self.call('run_python', **check),
+            self.call('finish', status='success', message='Partial rename accepted.'),
+            self.call('review_mismatch', decision='repair_candidate', reason='The print still uses the global function instead of the loop value.'),
+            self.call('replace_text', path='answer.py', old='print(label, aggregate)', new='print(label, value)'),
+            self.call('run_python', **check),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        reviews = [json.loads(m['content']) for m in history if m['role'] == 'tool'
+                   and json.loads(m['content']).get('decision') == 'repair_candidate']
+        self.assertTrue(reviews[0]['repair_required'])
+        self.assertIn('print(label, aggregate)', json.dumps(reviews[0]['current_source']))
+        self.assertEqual(self.workspace.execute('run_python', {'path': 'answer.py'})['stdout'], '7\nsample 9\n')
+
+    def test_repeat_detection_uses_source_and_test_not_volatile_output(self):
+        self.workspace.write_bytes('answer.py', b'print(lambda: None)')
+        checks = CompletionChecks(self.workspace, set(), True)
+        arguments = {'path': 'answer.py', 'reference_code': 'print(9)'}
+        first = {'stdout': '<function at 0x123>\n', 'stderr': '', 'reference': {'stdout': '9\n', 'stderr': ''}}
+        checks.tested(arguments, first, True)
+        second = {**first, 'stdout': '<function at 0x456>\n'}
+        checks.tested(arguments, second, True)
+        self.assertTrue(second['repeat_failure'])
+        self.workspace.write_bytes('answer.py', b'print(8)')
+        third = {**first, 'stdout': '8\n'}
+        checks.tested(arguments, third, True)
+        self.assertFalse(third['repeat_failure'])
+
+    def test_rewrite_resets_patch_failures_even_with_remaining_interface_error(self):
+        source = "import argparse\np=argparse.ArgumentParser()\na=p.parse_args()\nprint(4)"
+        # Include another declaration so static interface review applies.
+        source = source.replace('a=p.parse_args()', "p.add_argument('command',nargs='?')\na=p.parse_args()")
+        history = self.scripted('Implement answer.py that prints 4 and supports --mode.', [
+            self.call('write_file', path='answer.py', content='print(3)'),
+            *[self.call('replace_text', path='answer.py', old='absent', new='print(4)') for _ in range(3)],
+            self.call('write_file', path='answer.py', content=source),
+            self.call('replace_text', path='answer.py', old='a=p.parse_args()',
+                      new="p.add_argument('--mode')\na=p.parse_args()\nif a.mode: pass"),
+            self.call('run_python', path='answer.py'),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        self.assertIn("p.add_argument('--mode')", (self.root / 'answer.py').read_text())
+        errors = [json.loads(m['content']).get('message', '') for m in history if m['role'] == 'tool']
+        self.assertFalse(any('Repeated small edits' in error for error in errors))
 
     def test_failed_exact_edit_returns_current_source_for_repair(self):
         history = self.scripted('Implement answer.py that prints 4.', [
@@ -647,6 +818,15 @@ class FinalToolTests(unittest.TestCase):
 
 
 class StreamTests(unittest.TestCase):
+    def test_context_limit_is_distinguished_from_gateway_failure(self):
+        error = urllib.error.HTTPError('https://example.invalid', 400, 'Bad Request', {},
+                                      io.BytesIO(b'{"error":{"message":"maximum context length is 40960 tokens"}}'))
+        with patch.dict(os.environ, {'QWEN_API_KEY': 'test-key'}), \
+                patch('model_client.urllib.request.urlopen', side_effect=error) as opened:
+            with self.assertRaises(ContextLimitError):
+                request_completion([], [], time.monotonic() + 60)
+        self.assertEqual(opened.call_count, 1)
+
     def test_recovers_from_repeated_gateway_framing_errors_without_echoing_prompts(self):
         errors = [urllib.error.HTTPError('https://example.invalid', 400, 'Bad Request', {},
                   io.BytesIO(b'<html>Bad request syntax (private unrelated prompt)</html>')) for _ in range(3)]

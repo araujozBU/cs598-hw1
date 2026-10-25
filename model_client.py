@@ -12,6 +12,10 @@ class AgentError(Exception):
     pass
 
 
+class ContextLimitError(AgentError):
+    pass
+
+
 def parse_completion(response):
     if 'text/event-stream' not in response.headers.get('Content-Type', ''):
         choice = json.load(response)['choices'][0]
@@ -95,6 +99,9 @@ def request_completion(messages, tools, deadline, temperature=0, tool_choice='au
                 # Report the failure category without copying request contents.
                 diagnostic = 'gateway HTTP framing rejection' if transport_rejection else detail
                 print(f'Endpoint HTTP {exc.code}: {diagnostic}', file=sys.stderr)
+            if exc.code == 400 and ('maximum context length' in detail.lower()
+                                    or 'context_length_exceeded' in detail.lower()):
+                raise ContextLimitError('Model context limit exceeded; shorten the request before retrying.') from None
             retry_limit = 4 if transport_rejection else 2
             if (exc.code in (429, 502, 503, 504) or transport_rejection) and attempt < retry_limit:
                 try:
