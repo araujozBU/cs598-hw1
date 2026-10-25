@@ -3,6 +3,7 @@
 import io
 import json
 import os
+from contextlib import redirect_stderr
 from pathlib import Path
 import sys
 import tempfile
@@ -13,7 +14,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from agent import AgentError, MAX_MODEL_CALLS, PROGRAMMING_PROMPT, Workspace, is_programming_request, model_request, run_agent
+from agent import AgentError, MAX_MODEL_CALLS, PROGRAMMING_PROMPT, Workspace, is_programming_request, model_request, probe_invalid_csv_rows, run_agent
 from model_client import ContextLimitError, parse_completion, request_completion
 from completion_checks import CompletionChecks
 
@@ -297,6 +298,22 @@ class FinalToolTests(unittest.TestCase):
         self.assertIn("p.add_argument('--mode')", (self.root / 'answer.py').read_text())
         errors = [json.loads(m['content']).get('message', '') for m in history if m['role'] == 'tool']
         self.assertFalse(any('Repeated small edits' in error for error in errors))
+
+    def test_failed_patch_preserves_original_runtime_defect(self):
+        history = self.scripted('Implement answer.py that prints True.', [
+            self.call('write_file', path='answer.py', content="print('abc'.match('abc'))"),
+            self.call('run_python', path='answer.py'),
+            self.call('replace_text', path='answer.py', old='stale snippet', new='different snippet'),
+            self.call('replace_text', path='answer.py', old="'abc'.match('abc')", new="'abc' == 'abc'"),
+            self.call('run_python', path='answer.py'),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        errors = [json.loads(m['content']) for m in history if m['role'] == 'tool'
+                  and 'original_failure' in json.loads(m['content'])]
+        self.assertIn('AttributeError', errors[0]['original_failure']['stderr'])
+        self.assertIn('match', errors[0]['original_failure']['stderr'])
+        self.assertIn("print('abc'.match('abc'))", json.dumps(errors[0]['current_source']))
+        self.assertEqual((self.root / 'answer.py').read_text(), "print('abc' == 'abc')")
 
     def test_failed_exact_edit_returns_current_source_for_repair(self):
         history = self.scripted('Implement answer.py that prints 4.', [
@@ -759,6 +776,74 @@ class FinalToolTests(unittest.TestCase):
         self.assertNotEqual(result['reference']['exit_code'], 0)
         self.assertFalse(result['outputs_match'])
         self.assertEqual((self.root / 'answer.py').read_text(), 'print(2 + 2)')
+
+    def test_missing_stdlib_import_in_reference_recovers_without_editing_candidate(self):
+        (self.root / 'answer.py').write_text('print(2026)')
+        reference = "def year():\n    return datetime.strptime('2026-01-01', '%Y-%m-%d').year\nprint(year())"
+        result = self.workspace.execute('run_python', {'path': 'answer.py', 'reference_code': reference})
+        self.assertEqual(result['stdout'], '2026\n')
+        self.assertTrue(result['outputs_match'])
+        self.assertEqual(result['reference_import_added'], 'from datetime import datetime')
+        self.assertEqual((self.root / 'answer.py').read_text(), 'print(2026)')
+
+    def test_malformed_csv_probe_blocks_premature_success_and_allows_repair(self):
+        (self.root / 'input.csv').write_text('name,amount\nItem,1.00\n')
+        broken = ("import csv, sys\nrows = list(csv.reader(open(sys.argv[sys.argv.index('--file') + 1])))\n"
+                  "print(len(rows) - 1)\n")
+        repaired = 'print(sum(len(row) == len(rows[0]) for row in rows[1:]))'
+        replies = iter([
+            self.call('write_file', path='count.py', content=broken),
+            self.call('run_python', path='count.py', args=['count', '--file', 'input.csv']),
+            self.call('finish', status='success', message='Premature.'),
+            self.call('replace_text', path='count.py', old='print(len(rows) - 1)', new=repaired),
+            self.call('run_python', path='count.py', args=['count', '--file', 'input.csv']),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        history = []
+        result = run_agent('Implement count.py with a count command, --file PATH, and CSV input. '
+                           'Skip invalid rows with missing or extra fields.', self.workspace,
+                           request=lambda messages, deadline: next(replies), history=history)
+        self.assertEqual(result['message'], 'Verified.')
+        self.assertTrue(any('missing-field CSV record' in message['content'] for message in history
+                            if message['role'] == 'tool'))
+
+    def test_dictreader_probe_suggests_guard_for_missing_and_extra_cells(self):
+        (self.root / 'input.csv').write_text('name,amount\nItem,1.00\n')
+        source = ("import csv, sys\nfrom decimal import Decimal\n"
+                  "with open(sys.argv[sys.argv.index('--file') + 1]) as handle:\n"
+                  "    reader = csv.DictReader(handle)\n    count = 0\n"
+                  "    for row in reader:\n        Decimal(row['amount'])\n        count += 1\n"
+                  "print(count)\n")
+        (self.root / 'count.py').write_text(source)
+        result = probe_invalid_csv_rows(self.workspace, 'count.py', 'input.csv')
+        self.assertEqual(result['probe_case'], 'missing-field')
+        edit = result['suggested_tool_call']['arguments']
+        self.workspace.execute('replace_text', edit)
+        self.assertEqual(probe_invalid_csv_rows(self.workspace, 'count.py', 'input.csv')['status'], 'success')
+
+    def test_repeated_broken_reference_fails_before_task_timeout(self):
+        replies = iter([
+            self.call('write_file', path='answer.py', content='print(4)'),
+            *[self.call('run_python', path='answer.py', reference_code='raise ValueError("bad oracle")')
+              for _ in range(3)],
+        ])
+        with self.assertRaisesRegex(AgentError, 'Independent reference failed three times'):
+            run_agent('Implement answer.py to print 4.', self.workspace,
+                      request=lambda messages, deadline: next(replies), history=[])
+
+    def test_debug_log_summarizes_success_without_null_text_or_source_dump(self):
+        replies = iter([
+            self.call('write_file', path='answer.py', content='print(4)'),
+            self.call('run_python', path='answer.py'),
+            self.call('finish', status='success', message='Verified.'),
+        ])
+        output = io.StringIO()
+        with patch.dict(os.environ, {'AGENT_DEBUG': '1'}), redirect_stderr(output):
+            run_agent('Implement answer.py to print 4.', self.workspace,
+                      request=lambda messages, deadline: next(replies), history=[])
+        self.assertNotIn('"text": null', output.getvalue())
+        self.assertIn('"stdout": "4\\n"', output.getvalue())
+        self.assertNotIn('current_source', output.getvalue())
 
     def test_explicit_compact_json_contract_rejects_spaced_output(self):
         def call(name, arguments):

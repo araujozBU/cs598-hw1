@@ -22,7 +22,7 @@ def call(name, **arguments):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--case', choices=['shadowing', 'reference', 'parser'], default='shadowing')
+    parser.add_argument('--case', choices=['shadowing', 'reference', 'parser', 'invalid-method'], default='shadowing')
     case = parser.parse_args().case
     source = ('def aggregate(values):\n    return sum(values)\n\ndef main():\n'
               '    print(aggregate([3, 4]))\n'
@@ -52,12 +52,20 @@ def main():
         test_args = ['top', '2']
         reference_code = 'print("9 7")'
         expected = '9 7\n'
-    seed = iter([
+    if case == 'invalid-method':
+        source = "print('hello'.contains('ell'))\n"
+        task = 'Implement example.py to print whether the string hello contains the substring ell.'
+        reference_code = "print('ell' in 'hello')"
+        expected = 'True\n'
+    steps = [
         call('plan_program', interface='Run example.py', approach='Implement the task and preserve every specified output and command.',
              checks=['Exact output comparison', 'Preserve other commands when applicable']),
         call('write_file', path='example.py', content=source),
         call('run_python', path='example.py', args=test_args, reference_code=reference_code),
-    ])
+    ]
+    if case == 'invalid-method':
+        steps.append(call('replace_text', path='example.py', old='nonexistent stale snippet', new='replacement'))
+    seed = iter(steps)
     real_calls = 0
 
     def request(messages, deadline):

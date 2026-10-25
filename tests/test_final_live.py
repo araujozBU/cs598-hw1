@@ -129,6 +129,7 @@ class FinalLiveTests(unittest.TestCase):
         else:
             self.assertNotEqual(process.returncode, 0)
             self.assertTrue(process.stderr.strip())
+            self.assertNotIn('Traceback', process.stderr)
             self.assertEqual(process.stdout, '')
         return process.stdout
 

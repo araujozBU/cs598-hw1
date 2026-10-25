@@ -193,6 +193,11 @@ tests use `expected_exit_code` and should omit the reference calculation; a corr
 rejection is accepted even if an optional reference is broken. Positive-output
 disagreements receive a focused Qwen review in a fresh context before the next
 repair action, distinguishing candidate defects from broken reference calculations.
+The runner retries a reference once with a missing standard-library import when
+its traceback identifies a known name. Reference repair requests include concise
+candidate and reference results instead of the full source dump. Three repeats
+of the same reference error stop with an explicit error before the task timer
+expires; they do not cause a successful candidate to be rewritten.
 This review uses the same Qwen model endpoint and counts toward the 120-call cap.
 An identical repeated failure returns current source for repair instead of forcing
 another identical review. The failed check remains pending until resolved.
@@ -209,6 +214,10 @@ generation tests. Repeated-check detection compares source and test inputs, so
 changing memory addresses in error output cannot disguise an unchanged failure.
 Use `python3 scripts/test_programming_repair.py --case reference` to check that
 a broken reference calculation is repaired without editing a correct program.
+Use `python3 scripts/test_programming_repair.py --case invalid-method` to check
+recovery from an invalid Python method followed by a rejected exact-text patch.
+Repair requests retain the original execution error after an edit fails; obsolete
+replacement snippets are omitted so the current source stays authoritative.
 Use `python3 scripts/test_programming_repair.py --case parser` to reproduce a
 competing-positional-arguments bug and verify the repair preserves a command
 that does not take the optional value. Repair context includes bounded previously
@@ -225,6 +234,12 @@ before relying on checks against a large clean dataset.
 This avoids asking the model to guess or manually
 transcribe expected totals. Independent live tests still fail on any incorrect
 output. Explicit requests to print compact JSON also receive a format check.
+When a programming prompt explicitly requires skipping invalid CSV rows and a
+`count --file` interface, the harness also checks a small input derived from
+the supplied CSV. Adding missing-field and extra-field records must leave the
+program's count output unchanged. This check runs after the first successful
+program test and again after source edits, without embedding assignment totals
+or a program solution. Temporary probe files are removed after each check.
 `analyze_python` executes a short snippet for independent calculations or report
 validation. A programming task cannot report success until every Python source
 file it wrote has been run with the expected exit code after its last edit. This is a minimum
@@ -416,8 +431,9 @@ UTF-8 without automatic newlines, missing parent directories are created, and
 deletion never removes directories. The harness uses a 290-second overall timer
 and at most 120 model calls. It disables thinking as in the course quick start.
 Each response is capped at 8,192 output tokens; oversized responses fail explicitly.
-Set `AGENT_DEBUG=1` to emit model completion text, tool names, and tool errors to
-stderr for troubleshooting; this can include task data.
+Set `AGENT_DEBUG=1` to emit model tool choices and bounded summaries of every
+tool result to stderr; this can include task data. A tool-call line omits `text`
+when the model sends no accompanying message.
 
 ## Tests
 

@@ -57,6 +57,8 @@ def tally_datasets():
             ('reversed.csv', list(reversed(random_rows))),
             ('cancellation.csv', [('2026-01-02', 'Credit', 'Food', 29),
                                   ('2026-01-02', 'Debit', 'FOOD', -29)]),
+            ('zero category.csv', [('2026-01-02', 'Free item', 'Free', 0),
+                                   ('2026-01-02', 'Paid item', 'Paid', 100)]),
             ('cents.csv', [('2026-01-02', 'Cent', 'Food', 1)] * 1001),
             ('header only.csv', [])]
 

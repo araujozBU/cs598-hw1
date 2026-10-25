@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -43,6 +44,20 @@ WORKSPACE_TOOLS = [
 ]
 WORKSPACE_NAMES = {t['function']['name'] for t in WORKSPACE_TOOLS}
 TEXT_LIMIT = 24000
+
+REFERENCE_IMPORTS = {
+    'datetime': 'from datetime import datetime',
+    'Decimal': 'from decimal import Decimal',
+    'csv': 'import csv',
+    'json': 'import json',
+    'Path': 'from pathlib import Path',
+}
+
+
+def missing_reference_import(stderr):
+    """Recover a missing standard-library name in an independent check only."""
+    match = re.search(r"NameError: name '([A-Za-z_]\w*)' is not defined", stderr)
+    return REFERENCE_IMPORTS.get(match.group(1)) if match else None
 
 
 def integer(arguments, name, default, low, high):
@@ -186,6 +201,14 @@ def run_python(workspace, arguments):
     if 'reference_code' in arguments:
         reference = run_python(workspace, {'code': arguments['reference_code'], 'args': args,
             'stdin': arguments.get('stdin', ''), 'timeout_seconds': duration})
+        import_line = missing_reference_import(reference['stderr'])
+        if import_line and reference['exit_code'] != arguments.get('expected_exit_code', 0):
+            repaired = run_python(workspace, {'code': import_line + '\n' + arguments['reference_code'],
+                'args': args, 'stdin': arguments.get('stdin', ''), 'timeout_seconds': duration})
+            if (repaired['exit_code'] == arguments.get('expected_exit_code', 0)
+                    and not repaired['timed_out'] and not repaired['output_truncated']):
+                reference = repaired
+                result['reference_import_added'] = import_line
         result['reference'] = reference
         result['outputs_match'] = (result['exit_code'] == reference['exit_code'] == arguments.get('expected_exit_code', 0)
             and not result['output_truncated'] and not reference['output_truncated']
